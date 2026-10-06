@@ -1,0 +1,112 @@
+# `options.async_mode: true` on an activity: start it, don't wait for it.
+#
+# An async activity does not block. Its `_` is a TOKEN, not its result:
+#
+#   async-activity:<task_name>:<run id>
+#
+# When the activity finishes, the engine publishes the result to the event bus as
+# an ordinary event whose event_type IS the token. Collect it with a `wait_for` on
+# that event_type (here) or with a state machine transition (18-async-activity-state-machine).
+#
+# The completion event:
+#
+#   topic       options.async_event_topic, or "default"
+#   event_type  the token
+#   data        the activity's result (null if it failed)
+#   metadata    {status: completed | failed, error (failed only), run_id,
+#                activity_type, activity_name, async_activity: true, workflow_id}
+#
+# The run id makes the token unique PER INVOCATION. Below, one task starts the
+# same activity twice from a loop and gets two different tokens -- neither
+# completion can be mistaken for the other. Because the token is not known in
+# advance, keep it in a variable and wait on '{{ token }}'.
+#
+# Rules of thumb:
+#   - Failure does not raise. Check `metadata.status` on the event.
+#   - A timeout does not raise either: `_` of the wait_for is null.
+#   - Each completion is consumed by the first matching wait_for.
+#   - Waiting is optional. Ignore the token and async_mode is fire-and-forget --
+#     but an activity still running when the workflow ends is cancelled. Work that
+#     must outlive the run belongs in a `detached` child (13-child-workflow-modes).
+#
+# Try:  -i '{"durations": [1, 1, 1]}'   three jobs, still about one second in total
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-async-activity
+  tags: [build-my-workflow, basics, level-5-events]
+
+input:
+  # Seconds per job. The first job is the SLOWEST, so the others finish while
+  # the workflow is still waiting on it -- see collect-results.
+  durations: [2, 1]
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: note-start
+      set:
+        - started_at: '{{ now() }}'
+
+    # --- start: each iteration returns at once with a token -------------------
+    # Same task, so the same task_name in every token; the run id differs.
+    - task_name: start-jobs
+      loop:
+        in: '{{ durations }}'
+        foreach: seconds
+        do:
+          task_name: slow-job
+          activity:
+            type: builtin.delay
+            input:
+              duration: '{{ seconds }}s'
+            options:
+              async_mode: true
+              async_event_topic: job_events
+      output:
+        as: tokens#                 # trailing `#` logs the tokens
+
+    # Runs while every job is still in flight. This overlap is the whole point.
+    - task_name: other-work
+      set:
+        - _log#: 'started {{ len(tokens) }} jobs, doing other work meanwhile'
+
+    # --- collect: one wait_for per token ---------------------------------------
+    # Results are collected in START order, not completion order. The faster jobs
+    # finish while we are still waiting on the first one; their completions are
+    # held for their own wait_for, not dropped and not handed to the wrong one.
+    - task_name: collect-results
+      loop:
+        in: '{{ tokens }}'
+        foreach: token
+        do:
+          task_name: await-job
+          wait_for:
+            event:
+              topic: job_events
+              event_type: '{{ token }}'
+            timeout_sec: 30
+          output:
+            data:
+              status: '{{ _["metadata"]["status"] if _ else "timed-out" }}'
+              result: '{{ _["data"] if _ else None }}'
+              error: '{{ _["metadata"].get("error") if _ else None }}'
+      output:
+        as: results
+
+    - task_name: stop-if-any-timed-out
+      raise:
+        if: '{{ any(r["status"] == "timed-out" for r in results) }}'
+        type: terminate
+        message: 'a job did not finish within 30s: {{ results }}'
+
+    - task_name: build-report
+      set:
+        - _elapsed: '{{ round((now() - started_at).total_seconds(), 1) }}'
+        - report:
+            tokens_are_unique: '{{ len(set(tokens)) == len(tokens) }}'
+            statuses: '{{ [r["status"] for r in results] }}'
+            # about max(durations), not sum(durations): the jobs overlapped
+            overlapped: '{{ _elapsed < sum(durations) }}'
+            elapsed_sec: '{{ _elapsed }}'

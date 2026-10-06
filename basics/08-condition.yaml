@@ -1,0 +1,131 @@
+# Conditional execution: `skip_if` on any task, plus `branches` and `switch`.
+#
+# skip_if    available on every task. When it is true the task is skipped: it does
+#            not run, its result is null, and its `output` does not run.
+# branches   if / elif / else: the first true condition's task runs.
+# switch     compare one value against cases: the first matching case runs.
+#
+# A condition is an expression that must evaluate to a bool, or a structured
+# tree that nests freely and short-circuits:
+#   {and: [c, ...]}   every sub-condition holds
+#   {or:  [c, ...]}   any sub-condition holds
+#   {not: c}
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-condition
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  age: 30
+  country: US
+  is_member: true
+  is_banned: false
+
+output: '{{ summary }}'
+
+main:
+  tasks:
+    # --- 1. skip_if: a guard on one task -----------------------------------
+    # It reads as "skip this when...", so the common guard needs no `not`.
+    - task_name: flag-minor
+      skip_if: '{{ age >= 18 }}'
+      set:
+        - is_minor#: true
+
+    # --- 2. branches: if / elif / else ---------------------------------------
+    - task_name: age-band
+      branches:
+        - if: '{{ age < 18 }}'
+          do:
+            set:
+              - band: minor
+        - elif: '{{ age < 65 }}'
+          do:
+            set:
+              - band: adult
+        - else:
+          do:
+            set:
+              - band: senior
+
+    # An `else` removes the need for a separate "defaults" step.
+    - task_name: membership
+      branches:
+        - if: '{{ is_member }}'
+          do:
+            set:
+              - discount#: 0.15
+              - perks: [priority-support, free-shipping]
+        - else:
+          do:
+            set:
+              - discount: 0.0
+              - perks: []
+
+    # --- 3. switch: one value, many cases ------------------------------------
+    # `value` is evaluated once. A case matches with `==`, or with `in` when its
+    # `match` is a list.
+    - task_name: region
+      switch:
+        value: '{{ country }}'
+        cases:
+          - match: [US, CA]
+            do:
+              set:
+                - region: north-america
+          - match: [GB, FR, DE]
+            do:
+              set:
+                - region: europe
+        default:
+          set:
+            - region: rest-of-world
+
+    # --- 4. structured conditions --------------------------------------------
+    # and: skip unless every sub-condition holds
+    - task_name: domestic-adult-member
+      skip_if:
+        not:
+          and:
+            - '{{ age >= 18 }}'
+            - '{{ country == "US" }}'
+            - '{{ is_member }}'
+      set:
+        - tier#: domestic-premium
+
+    # or: inside branches, a structured condition works the same way
+    - task_name: review
+      branches:
+        - if:
+            or:
+              - '{{ age < 18 }}'
+              - '{{ country not in ["US", "CA"] }}'
+          do:
+            set:
+              - needs_review#: true
+        - else:
+          do:
+            set:
+              - needs_review: false
+
+    # or on skip_if: "skip if banned or under 13"
+    - task_name: eligible
+      skip_if:
+        or:
+          - '{{ is_banned }}'
+          - '{{ age < 13 }}'
+      set:
+        - eligible#: true
+
+    - task_name: build-summary
+      set:
+        - summary:
+            band: '{{ band }}'
+            region: '{{ region }}'
+            discount: '{{ discount }}'
+            perks: '{{ perks }}'
+            # A skipped task writes nothing, so check before reading.
+            tier: '{{ tier if "tier" in __context__ else "standard" }}'
+            eligible: '{{ eligible if "eligible" in __context__ else False }}'
+            needs_review: '{{ needs_review }}'

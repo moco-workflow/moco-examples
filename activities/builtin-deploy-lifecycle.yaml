@@ -1,0 +1,486 @@
+# The WRITE side of `builtin.deploy.*`: publish, target, deploy and retire a
+# package end to end -- what `moco publish` and the deploy UI do under the hood.
+# (builtin-deploy.yaml is the read-only tour; builtin-deploy-rbac.yaml covers
+# auth.*.)
+#
+#   namespace.set -> wfspec.set
+#   package.set (1.0.0) -> package.file.set / file.get / file.delete -> package.get
+#   package.create_with_files (1.1.0, two files, atomic) -> package.get_files
+#   user.set + group.set / group.get / group.member.add / group.list_members
+#                                  -> query.get_group_members
+#   1.0.0 by hand:   deployment.set (inactive) -> target.add -> deployment.activate
+#                    -> deployment.get -> target.list -> query.is_user_targeted
+#                    -> target.remove -> deployment.deactivate
+#   1.1.0 atomic:    deploy_package (targeted at the group)
+#                    -> query.get_user_deployments / get_targeted_wfspec_version
+#                    / get_latest_package -> undeploy_package
+#   group.member.remove -> user.disable
+#   cleanup:         package.delete (cascades deployments, targets, files)
+#                    -> wfspec.delete -> namespace.delete -> group.delete -> user.delete
+#
+# SAFE BY CONSTRUCTION: every resource is created by this run under a
+# `act-scratch-<run id>` name and deleted before it ends. Deployments are only
+# ever active while TARGETED at the scratch user or group -- an active
+# deployment with no targets would apply to every user in the stage. The
+# exercise runs as an inline child with catch_exception, so cleanup still runs
+# when a step fails; each delete checks the resource exists first. The error is
+# re-raised afterwards.
+#
+# WARNING: builtin.deploy.* activities do NO authorization of their own (the
+# checks live in the sys.* wfspecs that normally wrap them). Pointed at real
+# names, a spec like this can change platform data for everyone.
+#
+# NEEDS: the deployment DB (MOCO_DEPLOY_DB_CONN_STR on the worker, or on
+# moco-server for --in-memory). Runs on both runtimes.
+#
+#   moco run builtin-deploy-lifecycle.yaml
+#   moco run builtin-deploy-lifecycle.yaml -i '{"stage_id": "beta"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-deploy-lifecycle
+  tags: [act-demo, builtin, deploy]
+
+context:
+  # The exercise. Runs inline (same workflow, no extra history) with
+  # catch_exception, so a failure comes back as {"result": "error", ...}.
+  exercise_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-builtin-deploy-lifecycle-exercise
+    input:
+      ids: {}
+      stage_id:
+      me:
+    output: '{{ report }}'
+    main:
+      tasks:
+        # --- registry: namespace -> wfspec -> packages ----------------------
+        - task_name: namespace-set
+          activity:
+            type: builtin.deploy.namespace.set
+            input:
+              namespace_id: '{{ ids["namespace"] }}'
+              namespace_name: '{{ ids["namespace"] }}'
+              description: scratch namespace from act-builtin-deploy-lifecycle
+        - task_name: wfspec-set
+          activity:
+            type: builtin.deploy.wfspec.set
+            input:
+              namespace_id: '{{ ids["namespace"] }}'
+              wfspec_name: '{{ ids["wfspec"] }}'
+              description: scratch wfspec
+              owner: '{{ me }}'
+              tags: [act-demo]
+
+        # 1.0.0 the long way: an empty package, then files one at a time
+        - task_name: package-set
+          activity:
+            type: builtin.deploy.package.set
+            input:
+              wfspec_name: '{{ ids["wfspec"] }}'
+              version_major: 1
+              version_minor: 0
+              version_patch: 0
+              manifest: {note: built file by file}
+              created_by: '{{ me }}'
+          output:
+            set:
+              - pkg_v1#: '{{ _["id"] }}'
+        - task_name: package-file-set
+          activity:
+            type: builtin.deploy.package.file.set
+            input:
+              package_id: '{{ pkg_v1 }}'
+              file_order: 0
+              filename: '{{ ids["wfspec"] }}.yaml'
+              content: |
+                wfspec_name: {{ ids["wfspec"] }}
+                wfspec_version: 1.0.0
+                body:
+                  transform: {output_data: [{hello: v1}]}
+        - task_name: package-file-set-extra
+          activity:
+            type: builtin.deploy.package.file.set
+            input:
+              package_id: '{{ pkg_v1 }}'
+              file_order: 1
+              filename: notes.txt
+              content: removed again two steps later
+        - task_name: package-file-get
+          activity:
+            type: builtin.deploy.package.file.get
+            input:
+              package_id: '{{ pkg_v1 }}'
+              filename: notes.txt
+          output:
+            set:
+              - notes_file_id: '{{ _["id"] }}'
+        - task_name: package-file-delete
+          activity:
+            type: builtin.deploy.package.file.delete
+            input: {file_id: '{{ notes_file_id }}'}
+        - task_name: package-get
+          activity:
+            type: builtin.deploy.package.get
+            input:
+              wfspec_name: '{{ ids["wfspec"] }}'
+              version_major: 1
+              version_minor: 0
+              version_patch: 0
+          output:
+            as: pkg_v1_record
+
+        # 1.1.0 the atomic way: package and files in one call
+        - task_name: package-create-with-files
+          activity:
+            type: builtin.deploy.package.create_with_files
+            input:
+              wfspec_name: '{{ ids["wfspec"] }}'
+              version_major: 1
+              version_minor: 1
+              version_patch: 0
+              manifest: {note: created atomically}
+              created_by: '{{ me }}'
+              files:
+                - file_order: 0
+                  filename: '{{ ids["wfspec"] }}.yaml'
+                  content: |
+                    wfspec_name: {{ ids["wfspec"] }}
+                    wfspec_version: 1.1.0
+                    body:
+                      transform: {output_data: [{hello: v1.1}]}
+                - file_order: 1
+                  filename: helper.yaml
+                  content: |
+                    wfspec_name: {{ ids["wfspec"] }}-helper
+                    wfspec_version: 1.1.0
+                    body:
+                      transform: {}
+          output:
+            set:
+              - pkg_v11#: '{{ _["id"] }}'
+        - task_name: package-get-files
+          activity:
+            type: builtin.deploy.package.get_files
+            input: {package_id: '{{ pkg_v11 }}'}
+          output:
+            set:
+              - v11_files#: '{{ [f["filename"] for f in _] }}'
+
+        # --- who gets it: a scratch user in a scratch group -----------------
+        - task_name: user-set
+          activity:
+            type: builtin.deploy.user.set
+            input:
+              user_id: '{{ ids["user"] }}'
+              display_name: act-demo scratch user
+        - task_name: group-set
+          activity:
+            type: builtin.deploy.group.set
+            input:
+              name: '{{ ids["group"] }}'
+              description: scratch group
+          output:
+            set:
+              - group_id#: '{{ _["id"] }}'
+        - task_name: group-get
+          activity:
+            type: builtin.deploy.group.get
+            input: {name: '{{ ids["group"] }}'}
+          output:
+            as: group_record
+        - task_name: group-member-add
+          activity:
+            type: builtin.deploy.group.member.add
+            input:
+              group_id: '{{ group_id }}'
+              member_user_id: '{{ ids["user"] }}'
+        - task_name: group-list-members
+          activity:
+            type: builtin.deploy.group.list_members
+            input: {group_id: '{{ group_id }}'}
+          output:
+            set:
+              - direct_members: '{{ [m["member_user_id"] for m in _] }}'
+        # recursive: follows nested groups down to users
+        - task_name: query-get-group-members
+          activity:
+            type: builtin.deploy.query.get_group_members
+            input: {group_id: '{{ group_id }}'}
+          output:
+            set:
+              - all_members#: '{{ _["user_ids"] }}'
+
+        # --- 1.0.0 deployed by hand ------------------------------------------
+        # Created INACTIVE and targeted before activation, so it is never an
+        # untargeted (= everyone) active deployment, even for a moment.
+        - task_name: deployment-set
+          activity:
+            type: builtin.deploy.deployment.set
+            input:
+              package_id: '{{ pkg_v1 }}'
+              stage_id: '{{ stage_id }}'
+              is_active: false
+              deployed_by: '{{ me }}'
+          output:
+            set:
+              - dep_v1#: '{{ _["id"] }}'
+        - task_name: target-add
+          activity:
+            type: builtin.deploy.target.add
+            input:
+              deployment_id: '{{ dep_v1 }}'
+              target_user_id: '{{ ids["user"] }}'
+              created_by: '{{ me }}'
+        - task_name: deployment-activate
+          activity:
+            type: builtin.deploy.deployment.activate
+            input: {deployment_id: '{{ dep_v1 }}'}
+        - task_name: deployment-get
+          activity:
+            type: builtin.deploy.deployment.get
+            input: {deployment_id: '{{ dep_v1 }}'}
+          output:
+            set:
+              - v1_active#: '{{ _["is_active"] }}'
+        - task_name: target-list
+          activity:
+            type: builtin.deploy.target.list
+            input: {deployment_id: '{{ dep_v1 }}'}
+          output:
+            set:
+              - v1_targets: '{{ [t["target_user_id"] or t["target_group_id"] for t in _] }}'
+        - task_name: query-is-user-targeted
+          activity:
+            type: builtin.deploy.query.is_user_targeted
+            input:
+              user_id: '{{ ids["user"] }}'
+              deployment_id: '{{ dep_v1 }}'
+          output:
+            set:
+              - v1_targets_user#: '{{ _["is_targeted"] }}'
+        # retire 1.0.0: deactivate FIRST, then drop the target, for the same
+        # reason as above
+        - task_name: deployment-deactivate
+          activity:
+            type: builtin.deploy.deployment.deactivate
+            input: {deployment_id: '{{ dep_v1 }}'}
+        - task_name: target-remove
+          activity:
+            type: builtin.deploy.target.remove
+            input:
+              deployment_id: '{{ dep_v1 }}'
+              target_user_id: '{{ ids["user"] }}'
+
+        # --- 1.1.0 deployed atomically, to the group -------------------------
+        - task_name: deploy-package
+          activity:
+            type: builtin.deploy.deploy_package
+            input:
+              package_id: '{{ pkg_v11 }}'
+              stage_id: '{{ stage_id }}'
+              target_group_ids: ['{{ group_id }}']
+              deployed_by: '{{ me }}'
+          output:
+            set:
+              - dep_v11#: '{{ _["id"] }}'
+        # the user reaches 1.1.0 through group membership
+        - task_name: query-get-user-deployments
+          activity:
+            type: builtin.deploy.query.get_user_deployments
+            input:
+              user_id: '{{ ids["user"] }}'
+              stage_id: '{{ stage_id }}'
+          output:
+            set:
+              - user_sees#: '{{ [d["package_id"] for d in _ if d["wfspec_name"] == ids["wfspec"]] }}'
+        # what `moco run <name>` would resolve for this user
+        - task_name: query-get-targeted-wfspec-version
+          activity:
+            type: builtin.deploy.query.get_targeted_wfspec_version
+            input:
+              wfspec_name: '{{ ids["wfspec"] }}'
+              user_id: '{{ ids["user"] }}'
+              stage_id: '{{ stage_id }}'
+          output:
+            set:
+              - resolved_while_deployed#: '{{ _["package_id"] if _ else None }}'
+        - task_name: query-get-latest-package
+          activity:
+            type: builtin.deploy.query.get_latest_package
+            input:
+              namespace_id: '{{ ids["namespace"] }}'
+              wfspec_name: '{{ ids["wfspec"] }}'
+          output:
+            set:
+              - latest_package: '{{ _["package_id"] if _ else None }}'
+        - task_name: undeploy-package
+          activity:
+            type: builtin.deploy.undeploy_package
+            input:
+              deployment_id: '{{ dep_v11 }}'
+              performed_by: '{{ me }}'
+        - task_name: query-after-undeploy
+          activity:
+            type: builtin.deploy.query.get_targeted_wfspec_version
+            input:
+              wfspec_name: '{{ ids["wfspec"] }}'
+              user_id: '{{ ids["user"] }}'
+              stage_id: '{{ stage_id }}'
+          output:
+            set:
+              - resolved_after_undeploy#: '{{ _["package_id"] if _ else None }}'
+
+        # --- membership and account ------------------------------------------
+        - task_name: group-member-remove
+          activity:
+            type: builtin.deploy.group.member.remove
+            input:
+              group_id: '{{ group_id }}'
+              member_user_id: '{{ ids["user"] }}'
+        - task_name: user-disable
+          activity:
+            type: builtin.deploy.user.disable
+            input: {user_id: '{{ ids["user"] }}'}
+          output:
+            set:
+              - user_status#: '{{ _["status"] }}'
+
+        - task_name: build-exercise-report
+          set:
+            - report:
+                result: ok
+                packages: ['{{ pkg_v1 }}', '{{ pkg_v11 }}']
+                v1_record_version: '{{ pkg_v1_record["version_major"] }}.{{ pkg_v1_record["version_minor"] }}.{{ pkg_v1_record["version_patch"] }}'
+                v11_files: '{{ v11_files }}'
+                group_found_by_name: '{{ group_record["id"] == group_id }}'
+                group_direct_members: '{{ direct_members }}'
+                group_all_members: '{{ all_members }}'
+                v1_was_active: '{{ v1_active }}'
+                v1_targets: '{{ v1_targets }}'
+                v1_targets_user: '{{ v1_targets_user }}'
+                user_sees_via_group: '{{ user_sees }}'
+                resolved_while_deployed: '{{ resolved_while_deployed }}'
+                latest_package: '{{ latest_package }}'
+                resolved_after_undeploy: '{{ resolved_after_undeploy }}'
+                user_status_after_disable: '{{ user_status }}'
+
+input:
+  stage_id: dev
+output: '{{ report }}'
+
+main:
+  tasks:
+    # Names are derived from this run's id: unique per run and stable on
+    # replay (a random() here would not be).
+    - task_name: scratch-names
+      set:
+        - me: '{{ __user_info__.get("user_id") }}'
+        - _sfx: '{{ __sys_info__.get("workflow_id").split(":")[-1][:8] }}'
+        - ids#:
+            namespace: 'act-scratch-{{ _sfx }}'
+            wfspec: 'act-scratch-{{ _sfx }}-wf'
+            user: 'act-scratch-{{ _sfx }}-user'
+            group: 'act-scratch-{{ _sfx }}-group'
+
+    - task_name: exercise
+      workflow:
+        contents_yaml: '{{ exercise_wfspec }}'
+        mode: inline
+        input:
+          ids: '{{ ids }}'
+          stage_id: '{{ stage_id }}'
+          me: '{{ me }}'
+      output:
+        as: exercise
+      on_error:
+        catch: true
+        do:
+          set:
+            - _caught: "{{ {'result': 'error', **_} }}"
+          output:
+            data: '{{ _caught }}'
+            as: exercise
+
+    # --- cleanup: always runs. Look first, delete only what exists. -------
+    # package.delete cascades to the package's files, deployments and their
+    # targets; namespace.delete would cascade to roles, but not to wfspecs.
+    - task_name: cleanup-package-list
+      activity:
+        type: builtin.deploy.package.list
+        input: {wfspec_name: '{{ ids["wfspec"] }}'}
+      output:
+        as: leftover_packages
+    - task_name: cleanup-packages
+      loop:
+        in: '{{ leftover_packages or [] }}'
+        foreach: item
+        do:
+          task_name: cleanup-package-delete
+          activity:
+            type: builtin.deploy.package.delete
+            input: {package_id: '{{ item["id"] }}'}
+    - task_name: cleanup-wfspec-get
+      activity:
+        type: builtin.deploy.wfspec.get
+        input: {wfspec_name: '{{ ids["wfspec"] }}'}
+      output:
+        as: leftover_wfspec
+    - task_name: cleanup-wfspec-delete
+      skip_if: '{{ leftover_wfspec is None }}'
+      activity:
+        type: builtin.deploy.wfspec.delete
+        input: {wfspec_name: '{{ ids["wfspec"] }}'}
+    - task_name: cleanup-namespace-get
+      activity:
+        type: builtin.deploy.namespace.get
+        input: {namespace_id: '{{ ids["namespace"] }}'}
+      output:
+        as: leftover_namespace
+    - task_name: cleanup-namespace-delete
+      skip_if: '{{ leftover_namespace is None }}'
+      activity:
+        type: builtin.deploy.namespace.delete
+        input: {namespace_id: '{{ ids["namespace"] }}'}
+    - task_name: cleanup-group-get
+      activity:
+        type: builtin.deploy.group.get
+        input: {name: '{{ ids["group"] }}'}
+      output:
+        as: leftover_group
+    - task_name: cleanup-group-delete
+      skip_if: '{{ leftover_group is None }}'
+      activity:
+        type: builtin.deploy.group.delete
+        input: {group_id: '{{ leftover_group["id"] if leftover_group else "" }}'}
+    - task_name: cleanup-user-get
+      activity:
+        type: builtin.deploy.user.get
+        input: {user_id: '{{ ids["user"] }}'}
+      output:
+        as: leftover_user
+    - task_name: cleanup-user-delete
+      skip_if: '{{ leftover_user is None }}'
+      activity:
+        type: builtin.deploy.user.delete
+        input: {user_id: '{{ ids["user"] }}'}
+
+    - task_name: build-report
+      set:
+        - report:
+            scratch_ids: '{{ ids }}'
+            exercise: '{{ exercise }}'
+            cleaned_up:
+              packages: '{{ [p["id"] for p in (leftover_packages or [])] }}'
+              wfspec: '{{ leftover_wfspec is not None }}'
+              namespace: '{{ leftover_namespace is not None }}'
+              group: '{{ leftover_group is not None }}'
+              user: '{{ leftover_user is not None }}'
+
+    # Cleanup is done; now surface the failure, if there was one.
+    - task_name: reraise
+      raise:
+        if: '{{ isinstance(exercise, dict) and exercise.get("result") == "error" }}'
+        type: error
+        message: 'exercise failed (scratch data cleaned up): {{ exercise.get("error_message") }}'

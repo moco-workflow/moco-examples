@@ -1,0 +1,137 @@
+# Error handling: retry policies, `on_error`, and raising your own errors.
+#
+# Retries come first. An activity's retry policy is header.metadata's
+# `default_activity_retry_policy` with the activity's own `options.retry_policy`
+# laid over it, field by field. Only the final failure, after the retries run
+# out, reaches `on_error`. (Retry policies apply on the Temporal runtime.)
+#
+# `on_error` is available on every task:
+#
+#   on_error:
+#     catch: true    the error is consumed; the result of `do` becomes the task's
+#                    result, and the task's own `output` is skipped
+#     catch: false   (default) `do` runs as a cleanup hook, then the original error
+#                    keeps propagating to the parent
+#     do: <task>     inside it, `_` is the error:
+#                    {error_type, error_message, error_detail}
+#
+# It catches errors from the task's kind and from its `output` (not from `skip_if`).
+# An error raised inside `do` replaces the original one. Control signals
+# (raise: terminate / exit / continue / break) are not errors and are never caught.
+#
+# Try:  -i '{"quantity": -2}'          the validation error is caught and repaired
+#       -i '{"fail_payment": false}'   checkout succeeds
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-error-handling
+  tags: [build-my-workflow, basics, level-5-errors]
+  metadata:
+    default_activity_retry_policy:
+      max_attempts: 3
+      initial_interval_sec: 1
+      timeout_sec: 60
+
+context:
+  log: []
+  reservation: null
+  payment: pending
+  checkout_error: null
+
+input:
+  quantity: 3
+  fail_payment: true
+
+output:
+  quantity: '{{ quantity }}'
+  reservation: '{{ reservation }}'
+  payment: '{{ payment }}'
+  log: '{{ log }}'
+
+main:
+  tasks:
+    # --- 1. catch and repair -------------------------------------------------
+    # `raise` with an error_type fails the task; catch: true turns the failure
+    # into a fallback value and the workflow carries on.
+    - task_name: validate-quantity
+      raise:
+        if: '{{ not isinstance(quantity, int) or quantity <= 0 }}'
+        type: error
+        error_type: ValidationError
+        message: 'quantity must be a positive integer, got {{ quantity }}'
+      on_error:
+        catch: true
+        do:
+          set:
+            - quantity: 1
+            - _t: '{{ log.append(_["error_type"] + ": " + _["error_message"] + " -> using 1") }}'
+
+    # --- 2. a per-activity retry policy ---------------------------------------
+    # max_attempts and timeout_sec override the header default; initial_interval_sec
+    # is inherited from it.
+    - task_name: reserve-stock
+      activity:
+        type: builtin.delay
+        input:
+          duration: 1s
+        options:
+          retry_policy:
+            max_attempts: 5
+            timeout_sec: 10
+      output:
+        data:
+          sku: SKU-A
+          quantity: '{{ quantity }}'
+        as: reservation
+
+    # --- 3. cleanup without catching, and catching one level up ----------------
+    - task_name: checkout
+      tasks:
+        - task_name: charge-card
+          raise:
+            if: '{{ fail_payment }}'
+            type: error
+            error_type: PaymentDeclined
+            message: card declined
+          on_error:
+            # catch: false is the default: release the stock, then let the error
+            # propagate to `checkout`.
+            do:
+              task_name: release-stock
+              set:
+                - reservation: null
+                - _t: '{{ log.append("released stock after " + _["error_type"]) }}'
+
+        # Not reached when charge-card fails: the error leaves the container.
+        - task_name: confirm
+          set:
+            - payment: charged
+
+      # The container catches what its children let through and keeps the error.
+      on_error:
+        catch: true
+        do:
+          set:
+            - checkout_error#: '{{ _ }}'
+
+    # --- 4. handle only the errors you expect -------------------------------------
+    # on_error catches every error type. To be selective, keep the error and
+    # re-raise anything unexpected.
+    - task_name: rethrow-unexpected
+      raise:
+        if: '{{ checkout_error is not None and checkout_error["error_type"] != "PaymentDeclined" }}'
+        type: error
+        error_type: CheckoutError
+        message: '{{ checkout_error["error_message"] if checkout_error else "" }}'
+
+    - task_name: payment-status
+      branches:
+        - if: '{{ checkout_error is None }}'
+          do:
+            set:
+              - _t: '{{ log.append("payment charged") }}'
+        - else:
+          do:
+            set:
+              - payment: declined
+              - _t: '{{ log.append("payment declined: " + checkout_error["error_message"]) }}'

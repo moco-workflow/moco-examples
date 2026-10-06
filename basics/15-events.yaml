@@ -1,0 +1,137 @@
+# Demonstrates the event bus: `emit_event` publishes, `wait_for` consumes.
+#
+# wait_for blocks until a matching event arrives or timeout_sec elapses. Its `_`
+# is the matched event ({topic, event_type, data, metadata, ...}), or null on
+# timeout -- a timeout is not an error, so test `_` in the task's `output`.
+#
+# Matching narrows in three stages, all optional:
+#   topic             the channel; defaults to "default"
+#   event_type        the event name within the topic
+#   match_expression  a predicate over the event, for picking one of many
+#
+# An event is consumed by the FIRST matching waiter. A second wait_for on the
+# same event will time out.
+#
+# Three producers are shown:
+#   1. an async child workflow emitting back to its parent
+#   2. an async_mode activity, whose completion is published as an ordinary
+#      event keyed by a token (17-async-activity has the full story)
+#   3. nothing at all -- the timeout path
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-events
+  tags: [build-my-workflow, basics, level-5-events]
+
+context:
+  # Emitting to yourself needs your own workflow id as the target.
+  self_id:
+
+input:
+  order_id: ORD-77
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: resolve-self-id
+      set:
+        - self_id#: '{{ __sys_info__.get("workflow_id") }}'
+
+    # --- 1. async child workflow emits back to the parent ------------------
+    # mode: async means the parent does not wait here; it waits below, on the
+    # event. Starting the producer BEFORE the wait_for is important --
+    # see the note about ordering at the bottom of this file.
+    - task_name: start-fulfilment
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-events-fulfilment
+            input:
+              order_id:
+              reply_to:
+            main:
+              tasks:
+                - task_name: do-the-work
+                  activity:
+                    type: builtin.delay
+                    input:
+                      duration: 1s
+                - task_name: publish-fulfilled
+                  emit_event:
+                    topic: order_events
+                    event_type: fulfilled
+                    target_workflow_id: '{{ reply_to }}'
+                    data:
+                      order_id: '{{ order_id }}'
+                      status: shipped
+        mode: async
+        input:
+          order_id: '{{ order_id }}'
+          reply_to: '{{ self_id }}'
+
+    # Wait for that specific order. match_expression guards against picking up
+    # an event meant for a different order on the same topic. `output.set` reads
+    # the event straight from `_`, so no separate "read" task is needed.
+    - task_name: await-fulfilment
+      wait_for:
+        event:
+          topic: order_events
+          event_type: fulfilled
+          match_expression: '{{ event.get("data", {}).get("order_id") == order_id }}'
+        timeout_sec: 30
+      output:
+        set:
+          - fulfilment#: '{{ _.get("data") if _ else None }}'
+
+    # --- 2. async_mode activity: completion arrives as an event ------------
+    # With async_mode the activity does not block; it returns a token, and the
+    # engine publishes the result later as an event whose event_type IS that
+    # token ("async-activity:<activity name>:<run id>"). The token is unique per
+    # invocation, so the wait_for below references the returned value.
+    - task_name: slow_lookup
+      activity:
+        type: builtin.delay
+        input:
+          duration: 1s
+        options:
+          async_mode: true
+          async_event_topic: order_events
+      output:
+        as: lookup_token#           # trailing `#` logs the token
+
+    - task_name: await-lookup
+      wait_for:
+        event:
+          topic: order_events
+          event_type: '{{ lookup_token }}'
+        timeout_sec: 30
+      output:
+        set:
+          - lookup_status#: '{{ _.get("metadata", {}).get("status") if _ else "timed-out" }}'
+
+    # --- 3. the timeout path ------------------------------------------------
+    # Nothing ever publishes this event, so `_` is null. This is a normal
+    # result, not an error -- branch on it.
+    - task_name: await-something-that-never-comes
+      wait_for:
+        event:
+          topic: order_events
+          event_type: cancelled
+        timeout_sec: 2
+      output:
+        as: cancel_event
+
+    - task_name: build-report
+      set:
+        - report:
+            order_id: '{{ order_id }}'
+            fulfilment: '{{ fulfilment }}'
+            lookup_status: '{{ lookup_status }}'
+            cancelled: '{{ cancel_event is not None }}'
+            timed_out_as_expected: '{{ cancel_event is None }}'
+
+# Ordering note: a wait_for only sees events published after it starts waiting,
+# and an async producer that finishes first will have its event dropped. Keep
+# the gap small, or give the producer a delay, as the child above does.

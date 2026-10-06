@@ -1,0 +1,99 @@
+# `builtin.execute_workflow`: run another wfspec as an ACTIVITY.
+#
+# The `workflow` statement is the usual way to call a child. This activity is
+# the lower-level alternative: the child is resolved and run at activity time,
+# so the spec to run can be chosen from data (a name, or inline content built
+# at runtime), and `options` exposes execute knobs such as catch_exception and
+# execute_mode.
+#
+#   wfspec.content  inline YAML (used here, so the spec runs from source)
+#   wfspec.name     a published spec, optionally wfspec.version
+#   options.catch_exception  return the error instead of failing the caller
+#
+# Three calls: an inline child with input, the same child picked by a runtime
+# variable, and a deliberately failing child with catch_exception: true.
+#
+# NEEDS: nothing. Runs on both runtimes.
+#
+#   moco run builtin-execute-workflow.yaml
+#   moco run builtin-execute-workflow.yaml -i '{"numbers": [10, 20, 30]}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-execute-workflow
+  tags: [act-demo, builtin]
+
+context:
+  summing_child#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-execute-workflow-child
+    input:
+      numbers: []
+    output: '{{ result }}'
+    main:
+      set:
+        - result:
+            count: '{{ len(numbers) }}'
+            total: '{{ sum(numbers) }}'
+  failing_child#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-execute-workflow-failing-child
+    main:
+      raise:
+        type: terminate
+        message: this child always fails
+
+input:
+  numbers: [3, 4, 5]
+  # set to a published spec name to run it by name instead of inline
+  child_name:
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- 1. inline content + input ------------------------------------------
+    - task_name: run-inline-child
+      activity:
+        type: builtin.execute_workflow
+        input:
+          wfspec:
+            content: '{{ summing_child }}'
+          input_data:
+            numbers: '{{ numbers }}'
+      output:
+        as: inline_result
+
+    # --- 2. spec chosen at runtime: by name if given, else inline ------------
+    - task_name: choose-child
+      set:
+        - chosen_wfspec#: '{{ {"name": child_name} if child_name else {"content": summing_child} }}'
+    - task_name: run-chosen-child
+      activity:
+        type: builtin.execute_workflow
+        input:
+          wfspec: '{{ chosen_wfspec }}'
+          input_data:
+            numbers: '{{ [n * 2 for n in numbers] }}'
+      output:
+        as: chosen_result
+
+    # --- 3. a failing child, caught instead of failing this workflow ---------
+    - task_name: run-failing-child
+      activity:
+        type: builtin.execute_workflow
+        input:
+          wfspec:
+            content: '{{ failing_child }}'
+          options:
+            catch_exception: true
+      output:
+        as: failed_result
+
+    - task_name: build-report
+      set:
+        - report:
+            inline_result#: '{{ inline_result }}'
+            chosen_result#: '{{ chosen_result }}'
+            failed_result#: '{{ failed_result }}'

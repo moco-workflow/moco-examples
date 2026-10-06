@@ -1,0 +1,95 @@
+# The smallest useful state machine: a document review.
+#
+#   draft --> in_review --> approved   (score >= threshold)
+#                       --> rejected   (score <  threshold)
+#
+# Two kinds of transition appear here:
+#   automatic      trigger: {}                 fires as soon as on_enter finishes
+#   conditional    trigger: {condition: ...}   automatic, but guarded
+#
+# The third kind, event-driven (trigger: {event_type: ...}), is left out so this
+# machine runs to completion on its own -- an event trigger with no publisher
+# would just block. See 04-human-in-the-loop for event-driven transitions, and
+# 02/03 for machines driven by sys.timer events.
+#
+# Conditional transitions out of one state must be mutually exclusive, and
+# should cover every case -- an uncovered case leaves the machine stuck.
+#
+# on_enter runs when a state is entered, on_exit when it is left. A state with
+# is_terminal: true ends the machine, and output_name captures the state it
+# finished in.
+#
+# Next: 02-continue-as-new (durability), 03-continue-as-new-timer (named
+# timers), and 04-human-in-the-loop (event-driven transitions).
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-simple-state-machine
+  tags: [build-my-workflow, state-machine]
+
+context:
+  history: []
+  score: 0
+
+input:
+  # Drives which branch the review takes
+  quality_score: 80
+  approval_threshold: 70
+
+output: '{{ final_state }}'
+
+main:
+  state_machine:
+    initial_state: draft
+    states:
+      - name: draft
+        on_enter:
+          task_name: enter-draft
+          set:
+            - _t: '{{ history.append("entered draft") }}'
+        on_exit:
+          task_name: leave-draft
+          set:
+            - _t: '{{ history.append("left draft") }}'
+
+      - name: in_review
+        on_enter:
+          tasks:
+            - task_name: enter-review
+              set:
+                - _t: '{{ history.append("entered in_review") }}'
+                - score: '{{ quality_score }}'
+
+      - name: approved
+        is_terminal: true
+        on_enter:
+          task_name: enter-approved
+          set:
+            - _t: '{{ history.append("approved with score " + str(score)) }}'
+
+      - name: rejected
+        is_terminal: true
+        on_enter:
+          task_name: enter-rejected
+          set:
+            - _t: '{{ history.append("rejected with score " + str(score)) }}'
+
+    transitions:
+      # Automatic: no trigger, so it fires once draft's on_enter completes.
+      # Without this the machine would sit in draft waiting for an event.
+      - from_state: draft
+        to_state: in_review
+        trigger: {}
+
+      # The two branches out of in_review are mutually exclusive and total.
+      - from_state: in_review
+        to_state: approved
+        trigger:
+          condition: '{{ score >= approval_threshold }}'
+
+      - from_state: in_review
+        to_state: rejected
+        trigger:
+          condition: '{{ score < approval_threshold }}'
+  output:
+    as: final_state

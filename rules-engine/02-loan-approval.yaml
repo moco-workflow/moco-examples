@@ -1,0 +1,199 @@
+# ================================================================================
+# RULES ENGINE DEMO - Loan Approval System
+# ================================================================================
+#
+# Demonstrates rule-based decision making using forward chaining.
+# The rules engine classifies an applicant across credit, income, and employment
+# dimensions, then a transform step computes the final approval score and decision.
+#
+# Two-phase design:
+#   Phase 1 (rules_engine): Derive categorical facts from input data
+#   Phase 2 (transform):   Compute arithmetic score and make decision
+#
+# ================================================================================
+
+# Loan approval system using rule-based forward chaining.
+# Demonstrates fact derivation, rule dependencies, and multi-step inference.
+header:
+  schema_version: 2.0.0
+  workflow_name: re-loan-approval
+  tags: [build-my-workflow, rules-engine]
+input:
+  applicant_id: "APP-2025-001"
+  applicant_email: "john.doe@example.com"
+  credit_score: 720
+  annual_income: 85000
+  employment_years: 7
+  debt_to_income_ratio: 0.32
+  loan_amount: 250000
+  loan_purpose: "home_purchase"
+
+output: '{{ loan_decision }}'
+
+main:
+  tasks:
+    # ================================================================
+    # PHASE 1: Rules engine - classify the applicant
+    # ================================================================
+    # Classify applicant by credit tier, income tier, employment stability, and DTI risk
+    - task_name: loan_classification
+      rules_engine:
+
+        input:
+          facts:
+            credit_score: "{{ credit_score }}"
+            annual_income: "{{ annual_income }}"
+            employment_years: "{{ employment_years }}"
+            debt_to_income_ratio: "{{ debt_to_income_ratio }}"
+          run_mode: forward
+
+        rules:
+          # --- DTI rejection check ---
+          - id: high_dti_rejection
+            name: "High DTI Rejection"
+            description: "Reject if debt-to-income ratio exceeds 43%"
+            if:
+              with_facts:
+                - debt_to_income_ratio
+              expression: "{{ debt_to_income_ratio > 0.43 }}"
+            then:
+              set_facts:
+                - auto_reject: true
+                - reject_reason: "Debt-to-income ratio exceeds 43%"
+
+          # --- Credit tier classification (mutually exclusive) ---
+          - id: credit_tier_excellent
+            name: "Credit Tier - Excellent"
+            if:
+              with_facts:
+                - credit_score
+              expression: "{{ credit_score >= 750 }}"
+            then:
+              set_facts:
+                - credit_tier: "excellent"
+                - base_approval_chance: 0.95
+
+          - id: credit_tier_good
+            name: "Credit Tier - Good"
+            if:
+              with_facts:
+                - credit_score
+              expression:
+                and:
+                  - "{{ credit_score >= 650 }}"
+                  - "{{ credit_score < 750 }}"
+            then:
+              set_facts:
+                - credit_tier: "good"
+                - base_approval_chance: 0.75
+
+          - id: credit_tier_fair
+            name: "Credit Tier - Fair"
+            if:
+              with_facts:
+                - credit_score
+              expression:
+                and:
+                  - "{{ credit_score >= 550 }}"
+                  - "{{ credit_score < 650 }}"
+            then:
+              set_facts:
+                - credit_tier: "fair"
+                - base_approval_chance: 0.4
+
+          - id: credit_tier_poor
+            name: "Credit Tier - Poor"
+            if:
+              with_facts:
+                - credit_score
+              expression: "{{ credit_score < 550 }}"
+            then:
+              set_facts:
+                - credit_tier: "poor"
+                - base_approval_chance: 0.1
+
+          # --- Income tier classification (mutually exclusive) ---
+          - id: high_income_bonus
+            name: "High Income Bonus"
+            if:
+              with_facts:
+                - annual_income
+              expression: "{{ annual_income >= 100000 }}"
+            then:
+              set_facts:
+                - income_tier: "high"
+                - income_modifier: 0.1
+
+          - id: medium_income
+            name: "Medium Income"
+            if:
+              with_facts:
+                - annual_income
+              expression:
+                and:
+                  - "{{ annual_income >= 50000 }}"
+                  - "{{ annual_income < 100000 }}"
+            then:
+              set_facts:
+                - income_tier: "medium"
+                - income_modifier: 0.05
+
+          - id: low_income_penalty
+            name: "Low Income Penalty"
+            if:
+              with_facts:
+                - annual_income
+              expression: "{{ annual_income < 50000 }}"
+            then:
+              set_facts:
+                - income_tier: "low"
+                - income_modifier: -0.1
+
+          # --- Employment stability ---
+          - id: employment_stability
+            name: "Employment Stability Bonus"
+            if:
+              with_facts:
+                - employment_years
+              expression: "{{ employment_years >= 5 }}"
+            then:
+              set_facts:
+                - employment_stable: true
+                - employment_modifier: 0.05
+
+      output:
+        as: derived_facts
+
+    # ================================================================
+    # PHASE 2: Compute final score and decision
+    # ================================================================
+    - set:
+        - base_chance: "{{ derived_facts.get('base_approval_chance', 0) }}"
+        - income_mod: "{{ derived_facts.get('income_modifier', 0) }}"
+        - employ_mod: "{{ derived_facts.get('employment_modifier', 0) }}"
+        - final_score: "{{ base_chance + income_mod + employ_mod }}"
+        - auto_reject: "{{ derived_facts.get('auto_reject', False) }}"
+        - reject_reason: "{{ derived_facts.get('reject_reason', '') }}"
+        - decision: "{{ 'rejected' if auto_reject else ('approved' if final_score >= 0.70 else 'rejected') }}"
+
+    # ================================================================
+    # PHASE 3: Build output
+    # ================================================================
+    - set:
+        - loan_decision:
+            applicant_id: "{{ applicant_id }}"
+            decision: "{{ decision }}"
+            scoring:
+              credit_tier: "{{ derived_facts.get('credit_tier', 'unknown') }}"
+              base_approval_chance: "{{ base_chance }}"
+              income_tier: "{{ derived_facts.get('income_tier', 'unknown') }}"
+              income_modifier: "{{ income_mod }}"
+              employment_stable: "{{ derived_facts.get('employment_stable', False) }}"
+              employment_modifier: "{{ employ_mod }}"
+              final_score: "{{ final_score }}"
+            rejection:
+              auto_reject: "{{ auto_reject }}"
+              reason: "{{ reject_reason }}"
+            loan_details:
+              amount: "{{ loan_amount }}"
+              purpose: "{{ loan_purpose }}"

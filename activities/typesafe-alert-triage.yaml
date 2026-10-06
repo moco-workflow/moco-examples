@@ -1,0 +1,203 @@
+# `typesafe.system_one`, part two: triage monitoring alerts given as JSON, with
+# questions built from data and the per-label probabilities used to decide
+# when NOT to trust the answer. (Part one, typesafe-system-one.yaml, covers the
+# basics on plain-text tickets.)
+#
+# What this adds:
+#   JSON state        `state` takes an object as-is -- no need to render the
+#                     alert as prose first
+#   dynamic questions one `owner_<team>` noul per entry in `teams`, built with a
+#                     dict comprehension, so adding a team is a data change
+#   described labels  choice criteria {label: description} tell the model what
+#                     each label means; score criteria are a rubric, index 0..n-1
+#   answers detail    `nouls` / `choices` / `scores` are the headline values;
+#                     `answers.<q>.probabilities` has the full distribution.
+#                     Here the gap between the top two severities decides
+#                     whether to act or hand the alert to a human
+#   guarding labels   a server may answer outside the criteria -- map anything
+#                     unexpected to a safe default instead of branching on it
+#   usage / model     token count and the model that actually answered
+#
+# The result is one routing decision per alert:
+#   page              sure it's sev1/sev2, owner(s) above the threshold
+#   ticket            sure it's sev3
+#   human_review      severity too close to call, or nobody clearly owns it
+#
+# NEEDS: a TypeSafe-compatible endpoint (hosted, or a local `laya-serve`),
+# configured on the worker (TYPESAFE_*) or passed as base_url / model /
+# apikey_secret_key. `--in-memory` runs the activity inside moco-server, which
+# needs the same settings.
+#
+# RUNTIME DIFFERENCE: expect different probabilities, and so different routes,
+# on the two runtimes. Temporal's JSON payload converter sorts dict keys, so on
+# Temporal the alert fields and the questions reach the model in alphabetical
+# order, while in-memory keeps the order written here -- and System One's answers
+# depend on that order. Each runtime is deterministic on its own. Tune the
+# thresholds on the runtime you deploy to.
+#
+#   moco run typesafe-alert-triage.yaml
+#   moco run typesafe-alert-triage.yaml -i '{"min_severity_margin": 0.3}'
+#   moco run typesafe-alert-triage.yaml -i '{"base_url": "http://localhost:8001"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-typesafe-alert-triage
+  tags: [act-demo, llm, requires-typesafe]
+
+context:
+  severity_labels: [sev1, sev2, sev3]
+
+input:
+  base_url:
+  model:
+  apikey_secret_key:
+
+  # A team is paged when System One gives it at least this probability of
+  # owning the alert. Several teams may clear it.
+  min_owner_probability: 0.5
+  # Act on the severity only if the top label beats the runner-up by this much.
+  min_severity_margin: 0.15
+
+  teams:
+    - name: payments
+      description: payment processing, checkout, billing and refunds
+    - name: database
+      description: postgres clusters, replication, connection pools, slow queries
+    - name: platform
+      description: kubernetes, networking, load balancers, DNS, certificates
+
+  alerts:
+    - id: ALR-1
+      service: checkout-api
+      alert: payment authorisations failing
+      error_rate_pct: 38
+      p99_latency_ms: 950
+      region: us-east-1
+      message: 'upstream card processor returned 502 for 38% of requests in the last 5m'
+    - id: ALR-2
+      service: reporting-worker
+      alert: nightly export job slower than usual
+      duration_min: 74
+      baseline_min: 60
+      message: 'export finished successfully, 23% over baseline'
+    - id: ALR-3
+      service: orders-db
+      alert: replication lag
+      lag_seconds: 45
+      connections_used_pct: 97
+      message: 'replica orders-db-2 lagging; connection pool near exhaustion'
+
+output: '{{ triage }}'
+
+main:
+  tasks:
+    # --- build the questions from data ------------------------------------
+    # The fixed questions plus one noul per team. Keys become the answer keys:
+    # nouls.owner_payments, nouls.owner_database, ...
+    - task_name: build-questions
+      set:
+        - questions: >-
+            {{ {
+              "severity": {
+                "type": "choice",
+                "instructions": "How severe is this monitoring alert?",
+                "criteria": {
+                  "sev1": "customer-facing outage or data loss, happening now",
+                  "sev2": "degraded service or imminent failure, customers may notice",
+                  "sev3": "no customer impact; informational or slow background work"
+                }
+              },
+              "urgency": {
+                "type": "score",
+                "instructions": "How soon does a human need to act?",
+                "criteria": ["this week", "today", "within the hour", "right now"]
+              },
+              "actionable": {
+                "type": "noul",
+                "instructions": "Is there something an engineer can do about this alert right now?"
+              },
+              **{
+                "owner_" + t["name"]: {
+                  "type": "noul",
+                  "instructions": "Does the " + t["name"] + " team (" + t["description"] + ") own the fix for this alert?"
+                }
+                for t in teams
+              }
+            } }}
+        - _question_names#: '{{ sorted(questions.keys()) }}'
+
+    - task_name: triage-each
+      loop:
+        in: '{{ alerts }}'
+        foreach: alert
+        do:
+          tasks:
+            # --- ask ------------------------------------------------------
+            # state is the alert object itself.
+            - task_name: classify-alert
+              activity:
+                type: typesafe.system_one
+                input:
+                  state: '{{ alert }}'
+                  questions: '{{ questions }}'
+                  base_url: '{{ base_url }}'
+                  model: '{{ model }}'
+                  apikey_secret_key: '{{ apikey_secret_key }}'
+                options:
+                  retry_policy:
+                    timeout_sec: 60
+                    max_attempts: 2
+              output:
+                as: answer
+
+            # --- read the answer, and how sure it is ----------------------
+            - task_name: read-answer
+              set:
+                - _claimed: '{{ (answer.get("choices") or {}).get("severity") }}'
+                # Guard: an answer outside the criteria becomes sev2, which
+                # routes to a human below rather than being silently dropped.
+                - severity: '{{ _claimed if _claimed in severity_labels else "sev2" }}'
+                # Full distribution, highest first, for the margin check.
+                - _probs: >-
+                    {{ sorted(((answer.get("answers") or {}).get("severity") or {})
+                              .get("probabilities", {}).values(), reverse=True) }}
+                - severity_margin: '{{ round(_probs[0] - _probs[1], 3) if len(_probs) > 1 else 1.0 }}'
+                - _nouls: '{{ answer.get("nouls") or {} }}'
+                - owner_probabilities: '{{ {t["name"]: round(_nouls.get("owner_" + t["name"], 0.0), 3) for t in teams} }}'
+                - owners: >-
+                    {{ [name for name, p in sorted(owner_probabilities.items(), key=lambda kv: -kv[1])
+                        if p >= min_owner_probability] }}
+                # urgency is an expected index into the rubric, e.g. 2.4
+                - urgency_score: '{{ round((answer.get("scores") or {}).get("urgency", 0.0), 2) }}'
+                - p_actionable: '{{ round(_nouls.get("actionable", 0.0), 3) }}'
+
+            # --- decide ---------------------------------------------------
+            - task_name: decide
+              set:
+                - route: >-
+                    {{ "human_review" if severity_margin < min_severity_margin
+                       else ("ticket" if severity == "sev3"
+                       else ("page" if owners else "human_review")) }}
+                - reason: >-
+                    {{ ("severity too close to call (margin " + str(severity_margin) + ")")
+                         if severity_margin < min_severity_margin
+                       else ("low severity" if severity == "sev3"
+                       else ("owned by " + ", ".join(owners) if owners
+                       else "no team above " + str(min_owner_probability))) }}
+                - line@:
+                    alert#: '{{ alert["id"] }} {{ alert["service"] }}: {{ alert["alert"] }}'
+                    route#: '{{ route }}'
+                    reason: '{{ reason }}'
+                    severity: '{{ severity }}'
+                    severity_margin: '{{ severity_margin }}'
+                    urgency_0_to_3: '{{ urgency_score }}'
+                    p_actionable: '{{ p_actionable }}'
+                    page: '{{ owners if route == "page" else [] }}'
+                    owner_probabilities: '{{ owner_probabilities }}'
+                    model: '{{ answer.get("model") }}'
+                    input_tokens: '{{ (answer.get("usage") or {}).get("input_tokens") }}'
+          # what each alert contributes to the collected list
+          output:
+            data: '{{ line }}'
+      output:
+        as: triage

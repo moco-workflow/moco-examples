@@ -1,0 +1,120 @@
+# `claude_agent.query`: run a whole Claude agent loop inside ONE activity.
+#
+#   prompt, system_prompt, model, effort
+#   apikey_secret_key   secret holding an Anthropic API key
+#   capabilities        what the agent may use -- it starts with NOTHING:
+#     builtin_tools     Claude Code tools, e.g. [Read, Grep, Glob]
+#     moco_tools        Moco activity types exposed as tools
+#                       (mcp__moco__<type with dots as underscores>); they run
+#                       under the caller's identity, so the agent cannot exceed
+#                       the caller's privileges
+#     mcp_servers / mcp_tools / plugins / skills
+#   max_turns, max_tool_calls, max_budget_usd, timeout_sec   hard limits
+#   relay_topic / relay_granularity   stream progress into the workflow
+#   env                 extra env for the agent process (e.g. HTTPS_PROXY);
+#                       ANTHROPIC_*, CLAUDE_*, PATH, ... are refused
+#
+# Output: {result, is_error, num_turns, total_cost_usd, tool_calls, denied_tools,
+#          timed_out, usage, ...}.
+#
+# Two runs: a text-only agent (the safest grant), then one allowed exactly one
+# Moco tool, http.request, and asked about a page it can only read by calling
+# it. Without elevated privilege only http.*, graphql.*, sql.*, llama_index.*
+# and google_drive.* activities may be bridged to an agent.
+#
+# NEEDS: the AGENT worker (moco-agent-worker) polling the `agent` task queue --
+# claude_agent.* is routed there, and the base worker / --in-memory runtime do
+# not host it; with no agent worker the run just waits. Plus an Anthropic key in
+# a secret (default MY_CLAUDE_APIKEY) and outbound HTTPS to the Anthropic API
+# from that worker (set https_proxy if it needs a proxy).
+#
+#   moco run claude-agent-query.yaml
+#   moco run claude-agent-query.yaml -i '{"https_proxy": "http://proxy:port"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-claude-agent-query
+  tags: [act-demo, llm, agent, requires-agent-worker, requires-llm-token]
+
+input:
+  apikey_secret_key: MY_CLAUDE_APIKEY
+  # Explicit, because the CLI bundled with claude-agent-sdk may be too old for
+  # the account's default model ("Claude Code X does not support this model").
+  model: claude-haiku-4-5
+  https_proxy:
+  topic: durable workflow engines
+  url: https://example.com
+  # passed to the agent's http_request calls; only for TLS-inspecting proxies
+  skip_cert_verify: false
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: agent-env
+      set:
+        - agent_env: '{{ {"HTTPS_PROXY": https_proxy} if https_proxy else {} }}'
+
+    # --- 1. text only: no tools at all ------------------------------------------
+    - task_name: text-only
+      activity:
+        type: claude_agent.query
+        input:
+          apikey_secret_key: '{{ apikey_secret_key }}'
+          model: '{{ model }}'
+          prompt: 'In at most two sentences, what problem do {{ topic }} solve?'
+          max_turns: 1
+          effort: low
+          timeout_sec: 240
+          env: '{{ agent_env }}'
+        options:
+          retry_policy:
+            timeout_sec: 300
+            max_attempts: 1
+      output:
+        set:
+          - text_answer#: '{{ _["result"] }}'
+          - text_failed: '{{ _["is_error"] }}'
+          - text_cost_usd: '{{ _.get("total_cost_usd") }}'
+
+    # An agent-side failure (API error, limit hit) is returned as data with
+    # is_error: true -- the activity itself succeeds. Check it.
+    - task_name: check-text-only
+      raise:
+        if: '{{ text_failed }}'
+        type: terminate
+        message: 'agent failed: {{ text_answer }}'
+
+    # --- 2. one Moco tool: http.request ---------------------------------------
+    - task_name: with-moco-tool
+      activity:
+        type: claude_agent.query
+        input:
+          apikey_secret_key: '{{ apikey_secret_key }}'
+          model: '{{ model }}'
+          prompt: >-
+            Fetch {{ url }} with the http_request tool (method GET, skip_cert_verify {{ "true" if skip_cert_verify else "false" }}) and tell me the page title and, in one sentence, what the page says. Do not guess.
+          capabilities:
+            moco_tools: [http.request]
+          max_turns: 4
+          max_tool_calls: 2
+          effort: low
+          timeout_sec: 240
+          env: '{{ agent_env }}'
+        options:
+          retry_policy:
+            timeout_sec: 300
+            max_attempts: 1
+      output:
+        set:
+          - tool_answer#: '{{ _["result"] }}'
+          - tools_used#: '{{ [c.get("name") for c in _.get("tool_calls", [])] }}'
+          - tool_cost_usd: '{{ _.get("total_cost_usd") }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            text_answer: '{{ text_answer }}'
+            tool_answer: '{{ tool_answer }}'
+            tools_used: '{{ tools_used }}'
+            cost_usd: '{{ (text_cost_usd or 0) + (tool_cost_usd or 0) }}'

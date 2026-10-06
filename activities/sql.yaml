@@ -1,0 +1,124 @@
+# `sql.execute` and `sql.query` against PostgreSQL.
+#
+#   sql.execute  write / DDL; returns {row_count}. `parameters` may be one dict
+#                or a list of dicts (executemany). Default max_attempts is 1,
+#                because a retried INSERT is a duplicate INSERT.
+#   sql.query    SELECT / ... RETURNING; returns {rows, columns, row_count}
+#
+# The connection string is never inline: `connection_string_secret_key` names a
+# secret holding e.g. postgresql://user:pass@host:5432/db (a bare postgresql://
+# URL is switched to the asyncpg driver automatically). Always bind values with
+# :name placeholders -- never format them into the SQL string.
+#
+# Each activity opens its own connection, so TEMP tables do not survive between
+# steps. The spec therefore creates a clearly-named scratch table, uses it, and
+# drops it at the end (keep_table: true to inspect it afterwards).
+#
+# NEEDS: a secret with a Postgres connection string (default MOCO_PGVECTOR_CONN,
+# which the rag demos also use). Create one with:
+#   moco secret upload MY_PG_CONN 'postgresql://moco:moco@localhost:5432/mocodb'
+#
+#   moco run sql.yaml
+#   moco run sql.yaml -i '{"connection_string_secret_key": "MY_PG_CONN"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-sql
+  tags: [act-demo, sql, requires-secret]
+
+input:
+  connection_string_secret_key: MOCO_PGVECTOR_CONN
+  table: act_demo_sql_items
+  keep_table: false
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # Table names cannot be bind parameters; guard the one we interpolate.
+    - raise:
+        if: '{{ not table.replace("_", "").isalnum() }}'
+        type: terminate
+        message: 'table must be alphanumeric/underscore, got {{ table }}'
+
+    - task_name: create-table
+      activity:
+        type: sql.execute
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          statement: >-
+            CREATE TABLE IF NOT EXISTS {{ table }} (
+              id SERIAL PRIMARY KEY, sku TEXT NOT NULL, qty INT NOT NULL)
+    - task_name: truncate
+      activity:
+        type: sql.execute
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          statement: 'TRUNCATE {{ table }} RESTART IDENTITY'
+
+    # executemany: a list of parameter dicts
+    - task_name: insert-many
+      activity:
+        type: sql.execute
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          statement: 'INSERT INTO {{ table }} (sku, qty) VALUES (:sku, :qty)'
+          parameters:
+            - {sku: apple, qty: 3}
+            - {sku: pear, qty: 7}
+            - {sku: plum, qty: 12}
+      output:
+        set:
+          # asyncpg reports -1 for executemany; single statements report real counts
+          - inserted#: '{{ _["row_count"] }}'
+
+    # a single parameter dict
+    - task_name: update-one
+      activity:
+        type: sql.execute
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          statement: 'UPDATE {{ table }} SET qty = qty + :delta WHERE sku = :sku'
+          parameters: {sku: apple, delta: 10}
+      output:
+        set:
+          - updated#: '{{ _["row_count"] }}'
+
+    - task_name: query-filtered
+      activity:
+        type: sql.query
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          query: 'SELECT sku, qty FROM {{ table }} WHERE qty >= :min_qty ORDER BY qty DESC'
+          parameters: {min_qty: 5}
+      output:
+        as: big_orders
+
+    # sql.query also covers writes that return rows
+    - task_name: delete-returning
+      activity:
+        type: sql.query
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          query: 'DELETE FROM {{ table }} WHERE sku = :sku RETURNING id, sku'
+          parameters: {sku: pear}
+      output:
+        set:
+          - deleted_rows#: '{{ _["rows"] }}'
+
+    - task_name: drop-table
+      skip_if: '{{ bool(keep_table) }}'
+      activity:
+        type: sql.execute
+        input:
+          connection_string_secret_key: '{{ connection_string_secret_key }}'
+          statement: 'DROP TABLE IF EXISTS {{ table }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            inserted: '{{ inserted }}'
+            updated: '{{ updated }}'
+            columns: '{{ big_orders["columns"] }}'
+            big_orders#: '{{ big_orders["rows"] }}'
+            deleted_rows: '{{ deleted_rows }}'

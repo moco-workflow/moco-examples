@@ -1,0 +1,178 @@
+# `rabbit.publish` + `rabbit.receive`, round-tripped inside one workflow.
+#
+#   rabbit.publish  publish one event {data, event_type, source, metadata} to a
+#                   RabbitMQ topic (routing key) on `exchange`.
+#   rabbit.receive  a LONG-RUNNING receiver: subscribes to the topic and relays
+#                   every message into the workflow as an event on
+#                   `relay_topic` / `relay_event_type`. It has no stop condition
+#                   and runs until the workflow ends -- always async_mode: true.
+#
+# Relayed event: event["data"] = {topic, data, event_type, metadata}, i.e. the
+# ORIGINAL publish is nested one level down.
+#
+# How this spec terminates: a state machine on the relay topic counts messages
+# carrying THIS run's run_id and finishes when all have arrived, or after
+# listen_timeout_sec (the state's sys.timer) so a dead broker cannot hang it.
+# The last message is published with event_type "last" to show filtering on the
+# original event type. Messages are keyed by seq, so a redelivery cannot be
+# double-counted. For a two-process version (listener + publisher in
+# separate runs) see ../../../moco-examples/rmq-demo.
+#
+# NEEDS: RabbitMQ. With connection_url empty the worker's
+# MOCO_RMQ_CONNECTION_URL is used (e.g. amqp://guest:guest@localhost:5672/moco-vhost).
+#
+#   moco run rabbit.yaml
+#   moco run rabbit.yaml --in-memory
+#   moco run rabbit.yaml -i '{"connection_url": "amqp://user:pass@host:5672/vhost"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-rabbit
+  tags: [act-demo, rabbitmq, requires-rabbitmq]
+
+context:
+  received: {}  # seq -> payload; a dict so a duplicate delivery is harmless
+  timed_out: false
+  # one rabbit.publish per message; the last one has event_type "last"
+  publisher_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-rabbit-publisher
+    input:
+      connection_url:
+      topic:
+      run_id:
+      message_count: 3
+    main:
+      tasks:
+        - activity:
+            type: builtin.delay
+            input:
+              duration: 1
+        - task_name: publish-all
+          loop:
+            in: '{{ list(range(message_count)) }}'
+            foreach: item
+            do:
+              task_name: publish
+              activity:
+                type: rabbit.publish
+                input:
+                  connection_url: '{{ connection_url }}'
+                  topic: '{{ topic }}'
+                  event_type: '{{ "last" if item == message_count - 1 else "normal" }}'
+                  source: act-rabbit
+                  data:
+                    run_id: '{{ run_id }}'
+                    seq: '{{ item }}'
+
+input:
+  connection_url:
+  topic: act_demo_rabbit
+  message_count: 3
+  # time for the receiver to bind its queue before we publish
+  settle_sec: 2
+  listen_timeout_sec: 30
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: ids
+      set:
+        - self_id: '{{ __sys_info__.get("workflow_id") or __sys_info__.get("trace_id") }}'
+        - run_id#: '{{ self_id[-12:] }}'
+
+    - task_name: rabbit-round-trip
+      state_machine:
+        initial_state: start
+        event_source_topic: act_rabbit_relay
+        states:
+          - name: start
+            on_enter:
+              tasks:
+                - task_name: start-receiver
+                  activity:
+                    type: rabbit.receive
+                    input:
+                      connection_url: '{{ connection_url }}'
+                      topic: '{{ topic }}'
+                      relay_topic: act_rabbit_relay  # == event_source_topic
+                      relay_event_type: rabbit_message
+                      target_workflow_id: '{{ self_id }}'
+                    options:
+                      async_mode: true
+
+                # execute_locally: false -- builtin.delay is a LOCAL activity by
+                # default and would run before the async activity above is even
+                # scheduled; a regular activity really waits after it starts.
+                - task_name: let-receiver-bind
+                  activity:
+                    type: builtin.delay
+                    input:
+                      duration: '{{ settle_sec }}'
+                    options:
+                      execute_locally: false
+
+          # The publisher is an ASYNC child workflow that waits a moment before
+          # publishing. Events are only handled while the machine is idle in a
+          # state; anything relayed while an on_enter is still running can be
+          # lost, so on_enter here just kicks the publisher off and returns.
+          - name: listen
+            timeout_sec: '{{ listen_timeout_sec }}'
+            on_enter:
+              task_name: start-publisher
+              workflow:
+                contents_yaml: '{{ publisher_wfspec }}'
+                mode: async
+                input:
+                  connection_url: '{{ connection_url }}'
+                  topic: '{{ topic }}'
+                  run_id: '{{ run_id }}'
+                  message_count: '{{ message_count }}'
+
+          - name: done
+            is_terminal: true
+
+        transitions:
+          - from_state: start
+            to_state: listen
+            trigger: {}
+
+          - from_state: listen
+            trigger:
+              event_type: rabbit_message
+              condition: >-
+                {{ event["data"]["data"].get("run_id") == run_id
+                   and event["data"]["event_type"] != "last" }}
+              action:
+                set:
+                  - _t: '{{ received.update({event["data"]["data"]["seq"]: event["data"]["data"]}) }}'
+                  - got#: '{{ event["data"]["data"] }}'
+
+          - from_state: listen
+            to_state: done
+            trigger:
+              event_type: rabbit_message
+              condition: >-
+                {{ event["data"]["data"].get("run_id") == run_id
+                   and event["data"]["event_type"] == "last" }}
+              action:
+                set:
+                  - _t: '{{ received.update({event["data"]["data"]["seq"]: event["data"]["data"]}) }}'
+
+          - from_state: listen
+            to_state: done
+            trigger:
+              event_type: sys.timer
+              action:
+                set:
+                  - timed_out#: true
+
+    - task_name: build-report
+      set:
+        - report:
+            run_id: '{{ run_id }}'
+            published: '{{ message_count }}'
+            received_count#: '{{ len(received) }}'
+            received: '{{ [received[k] for k in sorted(received)] }}'
+            timed_out: '{{ timed_out }}'

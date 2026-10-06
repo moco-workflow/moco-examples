@@ -1,0 +1,91 @@
+# `typesafe.system_one`: fast, typed classification of a piece of text (or
+# JSON) against named questions -- no prompt engineering, no output parsing.
+#
+#   state       the text / JSON object / array to judge
+#   questions   {name: {type, instructions, criteria}}, three types:
+#     noul      yes/no -> a probability
+#     choice    pick one label from criteria {label: description-or-null}
+#     score     expected score on an ordered rubric (criteria is a list, 0..n-1)
+#   model / base_url / apikey_secret_key / extra_body
+#               default to TYPESAFE_DEFAULT_MODEL / TYPESAFE_BASE_URL /
+#               TYPESAFE_API_KEY on the worker (a local Laya server needs no key)
+#
+# The answer comes back grouped by question type -- nouls / choices / scores,
+# each keyed by question name -- plus per-question detail and token usage.
+# This spec classifies each support ticket in `tickets` and routes it with a
+# plain condition -- the typical use: a cheap, deterministic router in front
+# of expensive LLM steps.
+#
+# NEEDS: a TypeSafe-compatible endpoint (hosted, or a local `laya-serve`),
+# configured on the worker or passed as base_url / model / apikey_secret_key.
+#
+#   moco run typesafe-system-one.yaml
+#   moco run typesafe-system-one.yaml -i '{"base_url": "http://localhost:8001"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-typesafe-system-one
+  tags: [act-demo, llm, requires-typesafe]
+
+context:
+  questions:
+    billing:
+      type: noul
+      instructions: Is this ticket about billing or payments?
+    tone:
+      type: choice
+      instructions: What is the tone of the customer?
+      criteria: {calm: null, frustrated: null, angry: null}
+    urgency:
+      type: score
+      instructions: How urgent is this ticket?
+      criteria: [low, medium, high]
+
+input:
+  base_url:
+  model:
+  apikey_secret_key:
+  tickets:
+    - I was charged twice for my subscription this month. Please fix this ASAP.
+    - How do I export my dashboard as a PDF?
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: classify-each
+      loop:
+        in: '{{ tickets }}'
+        foreach: ticket
+        do:
+          tasks:
+            - task_name: classify
+              activity:
+                type: typesafe.system_one
+                input:
+                  state: '{{ ticket }}'
+                  questions: '{{ questions }}'
+                  base_url: '{{ base_url }}'
+                  model: '{{ model }}'
+                  apikey_secret_key: '{{ apikey_secret_key }}'
+                options:
+                  retry_policy:
+                    timeout_sec: 60
+                    max_attempts: 2
+              output:
+                as: decision
+
+            - task_name: route
+              set:
+                - p_billing: '{{ (decision.get("nouls") or {}).get("billing") or 0.0 }}'
+                - result@:
+                    ticket: '{{ ticket }}'
+                    p_billing#: '{{ p_billing }}'
+                    tone#: '{{ (decision.get("choices") or {}).get("tone") }}'
+                    urgency_0_to_2#: '{{ (decision.get("scores") or {}).get("urgency") }}'
+                    route: '{{ "billing-team" if p_billing >= 0.5 else "general-support" }}'
+          # what each item contributes to the collected list
+          output:
+            data: '{{ result }}'
+      output:
+        as: report

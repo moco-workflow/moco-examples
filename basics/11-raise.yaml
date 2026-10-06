@@ -1,0 +1,107 @@
+# `raise`: fail, stop early, or leave a container or loop. Pick one with `mode`:
+#
+#   mode       raise type   effect                                        workflow result
+#   ---------  -----------  --------------------------------------------  ---------------
+#   error      error        fails with error_type / message; an           FAILED
+#                           `on_error` can catch it (16-error-handling)
+#   terminate  terminate    stops the whole workflow early, cleanly       SUCCEEDED, output
+#                                                                         has terminate_message
+#   exit       exit         leaves the nearest `tasks` container;         SUCCEEDED
+#                           execution continues after it
+#   continue   continue     skips the rest of this loop iteration         SUCCEEDED
+#   break      break        leaves the nearest loop                       SUCCEEDED
+#   none       -            nothing fires                                 SUCCEEDED
+#
+# `raise.if` is the condition under which it fires, so each raise reads as
+# "raise ... if ...". `type` is a literal, so each type gets its own task.
+# terminate / exit / continue / break are control signals, not errors:
+# `on_error` never sees them.
+#
+# The loop below wraps its checks in an inner `checks` group, which makes the three
+# loop-level signals visibly different in `trace` (item 2 is where they fire):
+#
+#   none      enter-1 checked-1 after-1 enter-2 checked-2 after-2 enter-3 checked-3 after-3 post-loop
+#   exit      enter-1 checked-1 after-1 enter-2 after-2 enter-3 checked-3 after-3 post-loop
+#             (only the `checks` group is left; the iteration carries on)
+#   continue  enter-1 checked-1 after-1 enter-2 enter-3 checked-3 after-3 post-loop
+#             (the rest of iteration 2 is skipped, from any depth)
+#   break     enter-1 checked-1 after-1 enter-2 post-loop
+#             (the whole loop ends)
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-raise
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  mode: none
+
+output:
+  trace: '{{ trace }}'
+
+main:
+  tasks:
+    - task_name: init-trace
+      set:
+        - trace: []
+
+    # --- fail the workflow ---------------------------------------------------
+    # error_type defaults to WorkflowError. (v1's `abort` is error_type: AbortError.)
+    - task_name: raise-error
+      raise:
+        if: '{{ mode == "error" }}'
+        type: error
+        error_type: DemoError
+        message: 'raised on purpose (mode={{ mode }})'
+
+    # --- stop early, but successfully ----------------------------------------
+    # Use it for "nothing to do" exits. The workflow `output` is still evaluated,
+    # and the engine adds terminate_message to it.
+    - task_name: raise-terminate
+      raise:
+        if: '{{ mode == "terminate" }}'
+        type: terminate
+        message: terminated on purpose
+
+    # --- loop control --------------------------------------------------------
+    - task_name: loop
+      loop:
+        in: '{{ [1, 2, 3] }}'
+        foreach: n
+        do:
+          tasks:
+            - task_name: enter
+              set:
+                - _t: '{{ trace.append("enter-" + str(n)) }}'
+
+            - task_name: checks
+              tasks:
+                - task_name: exit-checks
+                  raise:
+                    if: '{{ n == 2 and mode == "exit" }}'
+                    type: exit
+                    message: exit the checks group at item 2
+
+                - task_name: skip-item
+                  raise:
+                    if: '{{ n == 2 and mode == "continue" }}'
+                    type: continue
+                    message: skip the rest of item 2
+
+                - task_name: stop-loop
+                  raise:
+                    if: '{{ n == 2 and mode == "break" }}'
+                    type: break
+                    message: end the loop at item 2
+
+                - set:
+                    - _t: '{{ trace.append("checked-" + str(n)) }}'
+
+            - task_name: leave
+              set:
+                - _t: '{{ trace.append("after-" + str(n)) }}'
+
+    - task_name: post-loop
+      set:
+        - _t: '{{ trace.append("post-loop") }}'
+        - trace#: '{{ trace }}'

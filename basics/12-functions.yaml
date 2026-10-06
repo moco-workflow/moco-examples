@@ -1,0 +1,81 @@
+# Reusable `functions`, called with the `workflow` task.
+#
+# A function is a private sub-workflow of this document: `input` (parameters and
+# defaults), `output` (its result) and `main` (one task). Call it with
+#
+#   workflow:
+#     function: add
+#     input: {a: 1, b: 2}
+#
+# and store its result with the task's `output.as`, like any other task.
+#
+# Each call runs in a fresh context made only of its `input`, so a function cannot
+# read or clobber the caller's variables. Functions can call sibling functions in
+# the same document, but not themselves (directly or indirectly).
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-functions
+  tags: [build-my-workflow, basics, level-4-composition]
+
+input:
+  x: 5
+  y: 3
+
+output: '{{ summary }}'
+
+functions:
+  # The simplest function: no work in `main`, the result is computed by `output`.
+  add:
+    input:
+      a: 0
+      b: 0
+    output:
+      sum: '{{ a + b }}'
+    main:
+      set: []
+
+  # A function that calls a sibling function (`add`) and squares the result.
+  add_then_square:
+    input:
+      a: 0
+      b: 0
+    output:
+      value: '{{ squared }}'
+    main:
+      tasks:
+        - workflow:
+            function: add
+            input:
+              a: '{{ a }}'
+              b: '{{ b }}'
+          output:
+            data: '{{ _["sum"] }}'      # keep just the number
+            as: added
+        - set:
+            - squared: '{{ added ** 2 }}'
+
+main:
+  tasks:
+    - task_name: call-add
+      workflow:
+        function: add
+        input:
+          a: '{{ x }}'
+          b: '{{ y }}'
+      output:
+        as: add_result
+
+    - task_name: call-add-then-square
+      workflow:
+        function: add_then_square
+        input:
+          a: '{{ x }}'
+          b: '{{ y }}'
+      output:
+        as: square_result
+
+    - set:
+        - summary:
+            sum: '{{ add_result["sum"] }}'
+            sum_squared: '{{ square_result["value"] }}'

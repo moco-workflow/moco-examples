@@ -1,0 +1,216 @@
+# A live rules engine: a long-lived session that re-evaluates as facts stream in.
+#
+# Scenario: a service health monitor. Metric samples (cpu_pct, error_rate, p99_ms) arrive
+# one at a time; rules classify each signal and declare an incident once two of them agree.
+#
+#   keep_alive: true         don't return after the first pass -- keep the session open and
+#                            wait for more facts
+#   fact_source_topic        where fact updates arrive. Only events with
+#                            event_type: set_facts are applied, and event.data must be a
+#                            dict of fact -> value
+#   terminate_facts          the session ends as soon as all of these have been derived
+#   timeout_sec              ...or when this expires, returning whatever was derived so far
+#
+# How evaluation works in a live session:
+#   - a fact that has not arrived yet reads as None. A comparison against None raises, and a
+#     rule whose expression raises counts as not matching -- so `cpu_pct >= cpu_threshold`
+#     waits for free, but a rule that only tests presence must say `is not None`
+#   - after each update, only rules reading a *changed* fact are re-checked; derived facts
+#     then cascade (cpu_hot + errors_high -> incident) within the same update
+#   - derived facts are never retracted. Model escalations, not toggles
+#   - `set_facts` values are stored as written, not evaluated -- `{{ cpu_pct }}` would be
+#     kept as that literal string. Set flags or constants there
+#   - `actions` run in the *workflow's* scope, not the facts' -- they can read `service` and
+#     other workflow variables, but not `cpu_pct`. A NameError there is swallowed into the
+#     worker log, so keep facts out of action expressions
+#   - the result is the derived facts only, not the inputs
+#
+# HOW TO RUN
+#
+#   1. Hands-off (default): `simulate_feed: true` starts an async child that plays a metrics
+#      agent, emitting one sample per second from `samples` to this workflow.
+#
+#        moco run 03-live-rules-engine.yaml
+#
+#      Feed only healthy samples and the session runs until timeout_sec, then returns
+#      what it derived (nothing):
+#
+#        moco run 03-live-rules-engine.yaml -i '{"samples": [{"cpu_pct": 30}, {"error_rate": 0.001}], "timeout_sec": 8}'
+#
+#   2. Feed it yourself: start it without the simulator, then push facts with
+#      04-send-facts.yaml.
+#
+#        moco start 03-live-rules-engine.yaml -i '{"simulate_feed": false}'
+#        moco run 04-send-facts.yaml -i '{"workflow_id": "<id>", "facts": {"cpu_pct": 97}}'
+#        moco run 04-send-facts.yaml -i '{"workflow_id": "<id>", "facts": {"error_rate": 0.12}}'
+#        moco status <id>
+
+header:
+  schema_version: 2.0.0
+  workflow_name: re-live-rules-engine
+  tags: [build-my-workflow, rules-engine, live]
+
+context:
+  self_id:
+
+  # The simulated metrics agent: one set_facts event per sample, a second apart.
+  feed_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: re-live-rules-engine-feed
+    input:
+      target_workflow_id:
+      samples: []
+    main:
+      tasks:
+        # Give the rules engine time to subscribe; events published before it
+        # listens are dropped.
+        - task_name: warm-up
+          activity:
+            type: builtin.delay
+            input:
+              duration: 2s
+        - task_name: publish-samples
+          loop:
+            in: '{{ samples }}'
+            foreach: sample
+            do:
+              tasks:
+                - task_name: publish-sample
+                  emit_event:
+                    topic: health_metrics
+                    event_type: set_facts
+                    target_workflow_id: '{{ target_workflow_id }}'
+                    data: '{{ sample }}'
+                - task_name: sample-interval
+                  activity:
+                    type: builtin.delay
+                    input:
+                      duration: 1s
+
+input:
+  service: checkout-api
+  cpu_threshold: 85
+  error_rate_threshold: 0.05
+  p99_threshold_ms: 1000
+  timeout_sec: 120
+  # Stand-in for a metrics agent, so the spec completes on its own.
+  simulate_feed: true
+  samples:
+    - {cpu_pct: 42, error_rate: 0.002, p99_ms: 180}
+    - {cpu_pct: 61}
+    - {cpu_pct: 93}  # cpu_hot
+    - {p99_ms: 1450} # latency_high -> incident (cpu + latency)
+    - {error_rate: 0.09} # never applied: the session has already ended
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: resolve-self-id
+      set:
+        - self_id#: '{{ __sys_info__.get("workflow_id") }}'
+
+    # Start the producer first; the rules engine below blocks until it is done.
+    - task_name: start-simulated-feed
+      skip_if: '{{ not simulate_feed }}'
+      workflow:
+        contents_yaml: '{{ feed_wfspec }}'
+        mode: async
+        input:
+          target_workflow_id: '{{ self_id }}'
+          samples: '{{ samples }}'
+
+    - task_name: how-to-feed
+      skip_if: '{{ bool(simulate_feed) }}'
+      set:
+        - _how_to_feed#: >-
+            waiting for facts. Send some with: moco run 04-send-facts.yaml -i '{"workflow_id": "{{ self_id }}", "facts": {"cpu_pct": 97}}'
+    - task_name: health-monitor
+      rules_engine:
+        input:
+          keep_alive: true
+          fact_source_topic: health_metrics
+          terminate_facts: [incident]
+          timeout_sec: '{{ timeout_sec }}'
+          run_mode: forward
+          # Thresholds are facts too, so rules can read them via with_facts.
+          facts:
+            cpu_threshold: '{{ cpu_threshold }}'
+            error_rate_threshold: '{{ error_rate_threshold }}'
+            p99_threshold_ms: '{{ p99_threshold_ms }}'
+        rules:
+          # --- classify each signal as it arrives -----------------------------
+          - id: cpu_hot
+            name: CPU above threshold
+            if:
+              with_facts: [cpu_pct, cpu_threshold]
+              expression: '{{ cpu_pct >= cpu_threshold }}'
+            then:
+              set_facts:
+                - cpu_hot: true
+              actions:
+                - set:
+                    - _alert#: '{{ service }}: cpu above {{ cpu_threshold }}%'
+
+          - id: errors_high
+            name: Error rate above threshold
+            if:
+              with_facts: [error_rate, error_rate_threshold]
+              expression: '{{ error_rate >= error_rate_threshold }}'
+            then:
+              set_facts:
+                - errors_high: true
+              actions:
+                - set:
+                    - _alert#: '{{ service }}: error rate above {{ error_rate_threshold }}'
+
+          - id: latency_high
+            name: p99 latency above threshold
+            if:
+              with_facts: [p99_ms, p99_threshold_ms]
+              expression: '{{ p99_ms >= p99_threshold_ms }}'
+            then:
+              set_facts:
+                - latency_high: true
+              actions:
+                - set:
+                    - _alert#: '{{ service }}: p99 latency above {{ p99_threshold_ms }}ms'
+
+          # --- correlate: any two signals make an incident ---------------------
+          # These read derived facts, so they chain off the rules above.
+          - id: incident_saturation
+            name: Hot CPU and slow responses
+            if:
+              with_facts: [cpu_hot, latency_high]
+              expression: '{{ cpu_hot is not None and latency_high is not None }}'
+            then:
+              set_facts:
+                - incident: {severity: major, cause: saturation}
+              actions:
+                - set:
+                    - _incident#: 'INCIDENT on {{ service }}: saturation (hot cpu + slow responses)'
+
+          - id: incident_failing
+            name: Errors with hot CPU or slow responses
+            if:
+              with_facts: [errors_high, cpu_hot, latency_high]
+              expression: '{{ errors_high is not None and (cpu_hot is not None or latency_high is not None) }}'
+            then:
+              set_facts:
+                - incident: {severity: critical, cause: errors}
+              actions:
+                - set:
+                    - _incident#: 'INCIDENT on {{ service }}: failing requests'
+      output:
+        as: derived
+
+    - task_name: build-report
+      set:
+        - report:
+            service: '{{ service }}'
+            incident: '{{ derived.get("incident") }}'
+            signals:
+              cpu_hot: '{{ derived.get("cpu_hot", False) }}'
+              errors_high: '{{ derived.get("errors_high", False) }}'
+              latency_high: '{{ derived.get("latency_high", False) }}'
+            outcome: '{{ "incident declared" if "incident" in derived else "no incident before timeout" }}'

@@ -1,0 +1,82 @@
+# The variable-name modifiers as a narrative, over a parallel loop.
+# (05-expression has the compact table; 07-container-scope-variable goes deeper on `@`.)
+#
+#   name#          stream the value to the moco CLI when it is evaluated
+#   name@          store in the nearest container scope: here, one loop iteration
+#   _name          task-local: gone when the task ends
+#   name#jinja     render the value as a Jinja2 template
+#
+# Modifiers combine in this order: [_]name[@][#type...][#], e.g. `greeting_html@#jinja#`.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-variable-modifier
+  tags: [build-my-workflow, basics, level-2-data-flow]
+
+output:
+  greetings: '{{ greetings }}'
+
+main:
+  tasks:
+    - set:
+        # A trailing `#` emits the value to the moco CLI.
+        - users#:
+            - name: Alice
+              is_premium: true
+              shopping_list:
+                - apples
+                - oranges
+            - name: Bob
+              is_premium: false
+              shopping_list:
+                - bananas
+                - grapes
+
+    - task_name: greet-each-user
+      loop:
+        in: '{{ users }}'
+        foreach: user               # the loop variable is named; no copy needed
+        execute_mode: parallel      # iterations run concurrently
+        do:
+          tasks:
+            # `@` stores in this iteration's scope. Parallel iterations each get
+            # their own scope, so two users never overwrite each other's values.
+            - set:
+                - start_time@: '{{ now() }}'
+
+            - task_name: delay-for-user
+              activity:
+                type: builtin.delay
+                input:
+                  duration: '{{ 1 if user["is_premium"] else 2 }}s'
+
+            - set:
+                # `_end_time` is only needed to build the greeting.
+                - _end_time: '{{ now() }}'
+                - greeting@#: Hello {{ user["name"] }}! The current time is {{ _end_time }}, the start time is {{ start_time }}
+
+                # `#jinja` renders a template with if/for, which one Python
+                # expression cannot express. Visible variables are its context.
+                - greeting_html@#jinja#: |
+                    <h1>Hello, {{ user["name"] }}!</h1>
+
+                    {% if user["is_premium"] %}
+                      <p>Thank you for being a premium member.</p>
+                    {% else %}
+                      <p>Upgrade today for more features!</p>
+                    {% endif %}
+
+                    <ul>
+                    {% for item in user["shopping_list"] %}
+                      <li>{{ item | capitalize }}</li> {# Using a filter to capitalize text #}
+                    {% endfor %}
+                    </ul>
+
+          # What one iteration contributes to the loop's result list. The `@`
+          # values are still in scope here; they vanish when the iteration ends.
+          output:
+            data:
+              greeting: '{{ greeting }}'
+              greeting_html: '{{ greeting_html }}'
+      output:
+        as: greetings

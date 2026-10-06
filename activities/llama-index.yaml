@@ -1,0 +1,257 @@
+# The `llama_index.*` activities: index content into pgvector, then query it.
+#
+#   index_files   files under MOCO_RAG_FILE_DIR on the worker (default /tmp/moco/rag)
+#   index_docs    document URLs (.md/.html/.pdf/...), downloaded then parsed
+#   index_web     web pages, with a choice of loader (download, trafilatura, ...)
+#   index_site    crawl a site via its sitemap / RSS / whole-site crawl
+#   index_github  a GitHub repo (filter by dirs / extensions); needs a token secret
+#   index_gdrive  Drive folders / files (same auth block as gdrive.*)
+#   query         response_mode: retrieve -> the top_k chunks;
+#                 synthesize -> an LLM answer written over them
+#
+# Every call shares two blocks:
+#   vectordb_info    {connection_string_secret_key, table_name, schema_name}
+#   embed_model_info {apikey_secret_key, base_url, model_name, embed_dim} --
+#                    any OpenAI-compatible embeddings endpoint; embed_dim must
+#                    match the model and stay the same for the table
+# `metadata` is stamped on every chunk and `query.filters` matches on it, which
+# is how several collections share one table.
+#
+# Always runs: shell.run writes three small markdown notes under
+# MOCO_RAG_FILE_DIR, index_files indexes them, and query answers from them.
+# The network-bound indexers are opt-in via `extra_sources` (any of: docs,
+# web, site, github, gdrive) so the default run needs no internet. docs and
+# web honour MOCO_HTTP_PROXY; site, github and gdrive connect directly.
+#
+# NEEDS: a pgvector database behind a secret (default MOCO_PGVECTOR_CONN), an
+# embeddings endpoint (default: local Ollama with nomic-embed-text, 768 dims),
+# and for synthesize an LLM (default: the MY_LLM_TOKEN gateway). The worker must
+# be able to write rag_file_dir. See ../../../moco-examples/rag-demo for more.
+#
+#   moco run llama-index.yaml
+#   moco run llama-index.yaml -i '{"extra_sources": ["docs", "github"]}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-llama-index
+  tags: [act-demo, rag, requires-pgvector, requires-llm-token]
+
+context:
+  notes:
+    runtimes.md: |
+      # Runtimes
+      Moco has two runtimes. The in-memory runtime runs a workflow inside one
+      process and is the right choice for local tests: it needs no Temporal
+      server and starts instantly. The Temporal runtime is durable and
+      distributed, and is what production uses.
+    activities.md: |
+      # Activities
+      An activity is one unit of work - an HTTP call, a shell command, an LLM
+      call. Activities are retried according to their retry_policy.
+    events.md: |
+      # Events
+      Workflows exchange events with emit_event and wait_for. A state machine
+      consumes events from its event_source_topic.
+
+input:
+  question: Which runtime should I use for local tests, and why?
+  extra_sources: []  # any of: docs, web, site, github, gdrive
+  rag_file_dir: /tmp/moco/rag # must equal the worker's MOCO_RAG_FILE_DIR
+  table_name: act_demo_llama_index
+  pgvector_secret_key: MOCO_PGVECTOR_CONN
+  embed:
+    apikey_secret_key: MY_LLM_TOKEN  # ignored by Ollama, but required
+    base_url: http://localhost:11434/v1
+    model_name: nomic-embed-text
+    embed_dim: 768
+  llm:
+    apikey_secret_key: MY_LLM_TOKEN
+    base_url: https://llm.dev.bloomberg.com/v1
+    model_name: dsp.gemma-4-26b
+  # used only by the opt-in sources
+  doc_urls: [https://raw.githubusercontent.com/temporalio/documentation/main/README.md]
+  web_urls: [https://example.com]
+  site_url: https://example.com/sitemap.xml
+  github: {owner: temporalio, repo: samples-python, branch: main, include_directories: [hello], include_extensions: [.md], token_secret_key: GITHUB_TOKEN}
+  # the reader requires a token
+  gdrive: {credentials_secret_key: GDRIVE_SERVICE_ACCOUNT, folder_id: null}
+  skip_cert_verify: false
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: shared-blocks
+      set:
+        - vectordb:
+            connection_string_secret_key: '{{ pgvector_secret_key }}'
+            table_name: '{{ table_name }}'
+        - notes_json: '{{ json.dumps(notes) }}'
+
+    # --- 1. put some files where index_files can see them ------------------
+    - task_name: write-notes
+      activity:
+        type: shell.run
+        input:
+          command: |
+            mkdir -p "$DIR/act-llama-index" && python3 -c '
+            import json, os, sys
+            for name, text in json.loads(sys.argv[1]).items():
+                open(os.path.join(os.environ["DIR"], "act-llama-index", name), "w").write(text)
+            ' "$NOTES" && ls "$DIR/act-llama-index"
+          # env REPLACES the environment (PATH too): mkdir, python3 and ls
+          # resolve through /bin/sh's default PATH here
+          env:
+            DIR: '{{ rag_file_dir }}'
+            NOTES: '{{ notes_json }}'
+          check: true
+
+    # overwrite: true empties the WHOLE table first, keeping re-runs idempotent
+    - task_name: index-files
+      activity:
+        type: llama_index.index_files
+        input:
+          path: act-llama-index
+          required_extensions: [.md]
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          chunk_size: 512
+          chunk_overlap: 50
+          overwrite: true
+          metadata: {collection: notes}
+        options:
+          retry_policy: {timeout_sec: 300, max_attempts: 1}
+      output:
+        set:
+          - files_indexed#: '{{ _["document_count"] }}'
+
+    # --- 2. opt-in network sources (appended, never overwrite) --------------
+    - task_name: index-docs
+      skip_if: '{{ "docs" not in extra_sources }}'
+      activity:
+        type: llama_index.index_docs
+        input:
+          document_urls: '{{ doc_urls }}'
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+          metadata: {collection: docs}
+        options:
+          retry_policy: {timeout_sec: 600, max_attempts: 1}
+      output:
+        set:
+          - docs_result#: '{{ {"indexed": _["indexed_urls"], "failed": _["failed_urls"]} }}'
+
+    - task_name: index-web
+      skip_if: '{{ "web" not in extra_sources }}'
+      activity:
+        type: llama_index.index_web
+        input:
+          urls: '{{ web_urls }}'
+          loader: download
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+          metadata: {collection: web}
+        options:
+          retry_policy: {timeout_sec: 600, max_attempts: 1}
+      output:
+        set:
+          - web_result#: '{{ {"indexed": _["indexed_sources"], "failed": _["failed_sources"]} }}'
+
+    - task_name: index-site
+      skip_if: '{{ "site" not in extra_sources }}'
+      activity:
+        type: llama_index.index_site
+        input:
+          url: '{{ site_url }}'
+          crawler: sitemap
+          limit: 10
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          metadata: {collection: site}
+        options:
+          retry_policy: {timeout_sec: 900, max_attempts: 1}
+      output:
+        set:
+          - site_result#: '{{ {"indexed": _["indexed_sources"], "failed": _["failed_sources"]} }}'
+
+    - task_name: index-github
+      skip_if: '{{ "github" not in extra_sources }}'
+      activity:
+        type: llama_index.index_github
+        input:
+          auth:
+            token_secret_key: '{{ github["token_secret_key"] }}'
+          owner: '{{ github["owner"] }}'
+          repo: '{{ github["repo"] }}'
+          branch: '{{ github["branch"] }}'  # exactly one of branch / commit_sha
+          include_directories: '{{ github["include_directories"] }}'
+          include_extensions: '{{ github["include_extensions"] }}'
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          metadata: {collection: github}
+        options:
+          retry_policy: {timeout_sec: 900, max_attempts: 1}
+      output:
+        set:
+          - github_result#: '{{ {"indexed": len(_["indexed_sources"]), "failed": _["failed_sources"]} }}'
+
+    - task_name: index-gdrive
+      skip_if: '{{ "gdrive" not in extra_sources }}'
+      activity:
+        type: llama_index.index_gdrive
+        input:
+          auth:
+            credentials_secret_key: '{{ gdrive["credentials_secret_key"] }}'
+          folder_id: '{{ gdrive["folder_id"] }}'
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          metadata: {collection: gdrive}
+        options:
+          retry_policy: {timeout_sec: 900, max_attempts: 1}
+      output:
+        set:
+          - gdrive_result#: '{{ {"indexed": _["indexed_sources"], "failed": _["failed_sources"]} }}'
+
+    # --- 3. query -----------------------------------------------------------------
+    - task_name: retrieve
+      activity:
+        type: llama_index.query
+        input:
+          query: '{{ question }}'
+          response_mode: retrieve
+          top_k: 2
+          filters: {collection: notes}
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+        options:
+          retry_policy: {timeout_sec: 120, max_attempts: 2}
+      output:
+        set:
+          - top_chunks#: '{{ [{"score": round(n.get("score") or 0, 3), "text": n["text"][:80]} for n in _["nodes"]] }}'
+
+    - task_name: synthesize
+      activity:
+        type: llama_index.query
+        input:
+          query: '{{ question }}'
+          response_mode: synthesize
+          top_k: 2
+          filters: {collection: notes}
+          vectordb_info: '{{ vectordb }}'
+          embed_model_info: '{{ embed }}'
+          llm_model_info: '{{ llm }}'
+        options:
+          retry_policy: {timeout_sec: 180, max_attempts: 2}
+      output:
+        set:
+          - answer#: '{{ (_.get("answer") or "").strip() }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            question: '{{ question }}'
+            files_indexed: '{{ files_indexed }}'
+            top_chunks: '{{ top_chunks }}'
+            answer: '{{ answer }}'
+            extra_sources: '{{ extra_sources }}'

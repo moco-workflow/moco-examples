@@ -1,0 +1,95 @@
+# `shell.run`: run a command on the worker host.
+#
+#   command         the command line (run through the shell by default)
+#   env             the command's ENTIRE environment. It replaces the worker's
+#                   environment rather than extending it -- PATH included -- so
+#                   with `env` set only /bin/sh's built-in default PATH applies.
+#                   To add one variable and keep the rest, prefix the command
+#                   instead: 'FOO=bar mytool ...'
+#   cwd             working directory
+#   timeout         seconds before the process is killed
+#   check           true -> a non-zero exit code fails the activity;
+#                   false (default) -> exit code comes back as data
+#
+# Output: {return_code, stdout, stderr} (text, since text: true is the default).
+#
+# The command runs wherever the activity runs: on a Temporal worker host, or
+# inside moco-server for --in-memory. Treat it as remote code execution on that
+# box -- never build `command` from untrusted input.
+#
+# NEEDS: a POSIX shell on the worker. Runs on both runtimes.
+#
+#   moco run shell-run.yaml
+#   moco run shell-run.yaml -i '{"greeting": "hi there"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-shell-run
+  tags: [act-demo, shell]
+
+input:
+  greeting: hello from shell.run
+  work_dir: /tmp
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- simplest form ---------------------------------------------------------
+    - task_name: uname
+      activity:
+        type: shell.run
+        input:
+          command: uname -sr
+      output:
+        set:
+          - kernel#: '{{ _["stdout"].strip() }}'
+
+    # --- env + cwd + a pipeline -----------------------------------------------
+    # Passing data through env keeps it out of the command string, which
+    # avoids quoting and injection problems. `env` replaces the whole
+    # environment, which is fine here: echo, tr and pwd are on sh's default PATH.
+    - task_name: env-and-cwd
+      activity:
+        type: shell.run
+        input:
+          command: 'echo "$GREETING" | tr a-z A-Z && pwd'
+          env:
+            GREETING: '{{ greeting }}'
+          cwd: '{{ work_dir }}'
+          timeout: 10
+      output:
+        set:
+          - lines#: '{{ _["stdout"].strip().splitlines() }}'
+
+    # --- non-zero exit as data (check: false) -----------------------------------
+    - task_name: failing-command
+      activity:
+        type: shell.run
+        input:
+          command: 'echo "about to fail" >&2; exit 3'
+          check: false
+      output:
+        set:
+          - failed:
+              return_code#: '{{ _["return_code"] }}'
+              stderr: '{{ _["stderr"].strip() }}'
+
+    # --- produce JSON, parse it in the workflow ---------------------------------
+    - task_name: json-output
+      activity:
+        type: shell.run
+        input:
+          command: 'printf ''{"files": %s, "date": "%s"}'' "$(ls -1 /etc | wc -l)" "$(date -u +%Y-%m-%d)"'
+          check: true
+      output:
+        set:
+          - parsed#: '{{ json.loads(_["stdout"]) }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            kernel: '{{ kernel }}'
+            lines: '{{ lines }}'
+            failed: '{{ failed }}'
+            parsed: '{{ parsed }}'

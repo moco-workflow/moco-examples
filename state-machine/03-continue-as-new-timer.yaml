@@ -1,0 +1,85 @@
+# Demonstrates checkpoint_policy with timeout_sec, plus a named state timer.
+#
+# The `wait` state ticks on a named timer (`do_work`, 1s) and checkpoints on wall-clock time
+# spent in the state rather than on an event count. The runtime fires the continue-as-new and
+# resumes the machine back in `wait` -- no `check_continue_as_new` timer, no inline
+# continue_as_new_checkpoint statement, no `is_continue_as_new` sentinel.
+#
+# Named timers emit `sys.timer.<name>`; the unnamed `timeout_sec` on a state (02) emits plain
+# `sys.timer`. A state may declare several named timers and route each one differently.
+#
+# Runs for about `max_ticks` seconds and checkpoints every `checkpoint_sec`, so with the
+# defaults you see ~3 continue-as-new restarts before it exits. Watch `resumed_from` flip from
+# None to "wait" after the first one.
+#
+# Requires the wfspec body to be a single state_machine, which is what lets the runtime record
+# "resume in state X" and mean it.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-continue-as-new-timer
+  tags: [build-my-workflow, state-machine, requires-temporal]
+
+context:
+  tick_count: 0
+
+input:
+  max_ticks: 20
+  checkpoint_sec: 6
+
+output: '{{ final_state }}'
+
+main:
+  state_machine:
+    initial_state: init
+    states:
+      - name: init
+        on_enter:
+          set:
+            - _log#: "enter init state"
+
+      - name: wait
+        timers:
+          - name: do_work
+            timeout_sec: 1
+            max_timeout_attempts:  # fire forever; the exit transition below ends it
+        # The checkpoint timer is armed on entry and cancelled on exit, so it measures time
+        # spent here; on resume it is re-armed automatically.
+        checkpoint_policy:
+          timeout_sec: '{{ checkpoint_sec }}'
+          enforce: true  # only for the demo; in production let Temporal decide
+        on_enter:
+          set:
+            # on_enter does not re-run on resume, so this prints once per real entry.
+            - _log#: "enter wait state ({{ tick_count }})"
+
+      - name: exit
+        is_terminal: true
+        on_enter:
+          set:
+            - _log#: "enter exit state after {{ tick_count }} ticks"
+
+    transitions:
+      - from_state: init
+        to_state: wait
+        trigger: {}
+
+      # Internal transition (no to_state): stay in `wait` and count the tick.
+      - from_state: wait
+        to_state:
+        trigger:
+          event_type: sys.timer.do_work
+          condition: '{{ tick_count < max_ticks }}'
+          action:
+            set:
+              - tick_count: '{{ tick_count + 1 }}'
+              - _log#: "tick {{ tick_count }}"
+              - _resumed#: "resumed_from={{ __sys_info__.get('state_machine', {}).get('resumed_from_state') }}"
+
+      - from_state: wait
+        to_state: exit
+        trigger:
+          event_type: sys.timer.do_work
+          condition: '{{ tick_count >= max_ticks }}'
+  output:
+    as: final_state

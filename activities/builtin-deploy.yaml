@@ -1,0 +1,239 @@
+# A READ-ONLY tour of `builtin.deploy.*` -- the platform's registry of
+# namespaces, wfspecs, packages, stages, deployments, groups, users, API keys
+# and RBAC -- plus one self-contained API-key round trip.
+#
+# WARNING: builtin.deploy.* activities do NO authorization of their own; the
+# privilege checks live in the sys.* wfspecs that normally wrap them. A spec
+# that calls set / delete / deploy_package directly can change platform data
+# for everyone. This tour therefore only reads, with one exception:
+#
+#   apikey.create -> get -> lookup -> revoke -> delete on a key named
+#   act-demo-scratch-key.
+#   API-key activities are always scoped to the CALLER, so this can only touch
+#   your own keys. The plaintext key that create returns is never put in a
+#   variable, logged or returned -- but, like any activity result, it IS stored
+#   in the workflow's Temporal history. The key is deleted seconds later, so
+#   that copy is dead; still, set api_key_round_trip: false to skip this part.
+#
+# Covered: namespace.list/get/get_privileged, wfspec.list/get, package.list,
+# stage.list, deployment.list, query.get_wfspec_versions,
+# group.list, user.get/list, apikey.list (+ the round trip),
+# auth.get_user_roles / get_user_privileges / role.list, audit.get_logs.
+#
+# NEEDS: the deployment DB (MOCO_DEPLOY_DB_CONN_STR on the worker). Runs on
+# both runtimes. Pass a published wfspec name to see its packages and versions.
+#
+#   moco run builtin-deploy.yaml
+#   moco run builtin-deploy.yaml -i '{"wfspec_name": "moco-workflow-demo"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-deploy
+  tags: [act-demo, builtin, deploy]
+
+input:
+  wfspec_name:  # default: the first wfspec in your namespace
+  api_key_round_trip: true
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: whoami
+      set:
+        - user_id#: '{{ __user_info__.get("user_id") }}'
+
+    # --- namespaces -------------------------------------------------------------
+    - task_name: namespace-list
+      activity:
+        type: builtin.deploy.namespace.list
+      output:
+        as: namespaces
+    # the namespaces the caller has privileges in -- normally their home one
+    - task_name: namespace-get-privileged
+      activity:
+        type: builtin.deploy.namespace.get_privileged
+      output:
+        as: privileged_namespaces
+    - task_name: pick-namespace
+      set:
+        - my_namespace#: '{{ privileged_namespaces[0]["id"] if privileged_namespaces else user_id }}'
+    - task_name: namespace-get
+      activity:
+        type: builtin.deploy.namespace.get
+        input: {namespace_id: '{{ my_namespace }}'}
+      output:
+        as: namespace_record
+
+    # --- wfspecs, packages, versions ---------------------------------------------
+    - task_name: wfspec-list
+      activity:
+        type: builtin.deploy.wfspec.list
+        input: {namespace_id: '{{ my_namespace }}'}
+      output:
+        as: wfspecs
+    - task_name: pick-wfspec
+      set:
+        - wfspec_names: '{{ [w["name"] for w in (wfspecs or [])] }}'
+        - target_wfspec#: '{{ wfspec_name or (wfspec_names[0] if wfspec_names else None) }}'
+
+    - task_name: wfspec-details
+      skip_if: '{{ target_wfspec is None }}'
+      tasks:
+        - task_name: wfspec-get
+          activity:
+            type: builtin.deploy.wfspec.get
+            input: {wfspec_name: '{{ target_wfspec }}'}
+          output:
+            as: wfspec_record
+        - task_name: package-list
+          activity:
+            type: builtin.deploy.package.list
+            input: {wfspec_name: '{{ target_wfspec }}'}
+          output:
+            as: packages
+        - task_name: versions
+          activity:
+            type: builtin.deploy.query.get_wfspec_versions
+            input: {wfspec_name: '{{ target_wfspec }}'}
+          output:
+            as: versions
+
+    # --- stages and deployments ----------------------------------------------------
+    - task_name: stage-list
+      activity:
+        type: builtin.deploy.stage.list
+      output:
+        as: stages
+    - task_name: deployment-list
+      activity:
+        type: builtin.deploy.deployment.list
+        input: {}
+      output:
+        as: deployments
+
+    # --- groups, users, RBAC, audit -----------------------------------------------------
+    - task_name: group-list
+      activity:
+        type: builtin.deploy.group.list
+      output:
+        as: groups
+    - task_name: user-get-self
+      activity:
+        type: builtin.deploy.user.get
+        input: {user_id: '{{ user_id }}'}
+      output:
+        as: me
+    - task_name: user-list
+      activity:
+        type: builtin.deploy.user.list
+        input: {limit: 10}
+      output:
+        as: users
+    - task_name: my-roles
+      activity:
+        type: builtin.deploy.auth.get_user_roles
+        input: {user_id: '{{ user_id }}'}
+      output:
+        as: my_roles
+    - task_name: my-privileges
+      activity:
+        type: builtin.deploy.auth.get_user_privileges
+        input: {user_id: '{{ user_id }}'}
+      output:
+        as: my_privileges
+    - task_name: role-list
+      activity:
+        type: builtin.deploy.auth.role.list
+        input: {}
+      output:
+        as: roles
+    - task_name: audit-logs
+      activity:
+        type: builtin.deploy.audit.get_logs
+        input: {limit: 5}
+      output:
+        as: audit
+
+    # --- API keys: list, then a scratch create -> get -> revoke -> delete ------------
+    - task_name: apikey-list
+      activity:
+        type: builtin.deploy.apikey.list
+        input: {}
+      output:
+        as: my_keys
+
+    - task_name: apikey-round-trip
+      skip_if: '{{ not api_key_round_trip }}'
+      tasks:
+        - task_name: apikey-create
+          activity:
+            type: builtin.deploy.apikey.create
+            input:
+              name: act-demo-scratch-key
+          # expires_at is omitted: the schema types it as a date-time
+          # string, so `moco validate` rejects an expression there, and
+          # the key is deleted three steps later anyway
+          # output is {api_key: <one-time plaintext>, key_info: {...}};
+          # keep ONLY the id so the plaintext never reaches a variable
+          output:
+            set:
+              - scratch_key_id#: '{{ _["key_info"]["key_id"] }}'
+              - scratch_key_prefix: '{{ _["key_info"]["key_prefix"] }}'
+        - task_name: apikey-get
+          activity:
+            type: builtin.deploy.apikey.get
+            input: {key_id: '{{ scratch_key_id }}'}
+          output:
+            set:
+              - scratch_key_name: '{{ _.get("name") }}'
+        # lookup is what an auth server calls to verify a presented key: it
+        # finds the key by its non-secret prefix and returns the salted
+        # key_hash to compare against. Unlike every other apikey.* activity
+        # it is NOT scoped to the caller -- any prefix, anyone's key -- so it
+        # is only ever pointed at the key created above, and the hash is
+        # kept out of every variable (it still lands in Temporal history,
+        # like any activity result). touch: false leaves last_used_at alone.
+        - task_name: apikey-lookup
+          activity:
+            type: builtin.deploy.apikey.lookup
+            input:
+              key_prefix: '{{ scratch_key_prefix }}'
+              touch: false
+          output:
+            set:
+              - scratch_key_lookup#:
+                  found: '{{ _ is not None }}'
+                  same_key: '{{ bool(_) and _.get("key_id") == scratch_key_id }}'
+                  fields: '{{ sorted(_.keys()) if _ else [] }}'
+        - task_name: apikey-revoke
+          activity:
+            type: builtin.deploy.apikey.revoke
+            input: {key_id: '{{ scratch_key_id }}'}
+        - task_name: apikey-delete
+          activity:
+            type: builtin.deploy.apikey.delete
+            input: {key_id: '{{ scratch_key_id }}'}
+
+    - task_name: build-report
+      set:
+        - report:
+            user_id: '{{ user_id }}'
+            all_namespaces#: '{{ [n["id"] for n in namespaces] }}'
+            my_namespace: '{{ namespace_record.get("description") }}'
+            wfspec_count: '{{ len(wfspec_names) }}'
+            wfspec_names: '{{ wfspec_names[:10] }}'
+            target_wfspec: '{{ target_wfspec }}'
+            package_count: '{{ len(packages or []) if target_wfspec else None }}'
+            versions: '{{ [v["package_id"] for v in versions][:5] if target_wfspec else None }}'
+            stages#: '{{ [s["id"] for s in stages] }}'
+            deployment_count: '{{ len(deployments or []) }}'
+            group_count: '{{ len(groups or []) }}'
+            me: '{{ {k: me.get(k) for k in ("user_id", "display_name", "status")} if me else None }}'
+            user_count: '{{ len(users or []) }}'
+            my_roles: '{{ my_roles }}'
+            my_privilege_count: '{{ len(my_privileges or []) }}'
+            role_count: '{{ len(roles or []) }}'
+            recent_audit_actions: '{{ [a.get("action") for a in (audit or [])] }}'
+            my_key_names: '{{ [k.get("name") for k in (my_keys or [])] }}'
+            scratch_key_round_trip: '{{ scratch_key_name if api_key_round_trip else "skipped" }}'

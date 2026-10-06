@@ -1,0 +1,97 @@
+# An async activity's completion drives a state machine transition.
+#
+# The completion of an `async_mode` activity (17-async-activity) is an ordinary
+# event, so a state machine can react to it just as a `wait_for` does.
+#
+# A state machine in brief: it sits in a state until an event on its
+# `event_source_topic` matches a transition out of that state; then it runs the
+# transition's `action`, leaves (`on_exit`), and enters the target (`on_enter`).
+# It ends on an `is_terminal` state, and its `_` is that state's name.
+#
+# Three things make the async case work:
+#
+#   1. Start the activity INSIDE the machine, from `on_enter`. The machine only
+#      subscribes to its topic when it starts, so a completion published before
+#      that is never seen.
+#   2. Point `async_event_topic` at the machine's `event_source_topic`.
+#   3. Trigger on '{{ work_token }}'. A transition's event_type expression is
+#      re-evaluated for every incoming event, so it can match a token the machine
+#      produced itself. This is safe: `on_enter` finishes before the machine
+#      takes its first event, so work_token is set before any completion arrives.
+#
+# The event is in scope as `event` in a transition's `condition` and `action`
+# (not in the target state's `on_enter`), so read it in `action`. One event, two
+# transitions: `condition` on metadata.status picks success or failure.
+#
+# `timeout_sec` bounds the whole machine, so a completion that never arrives
+# fails the run instead of hanging it.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-async-activity-state-machine
+  tags: [build-my-workflow, basics, level-5-events]
+
+context:
+  outcome:
+
+input:
+  job_seconds: 2
+
+output:
+  final_state: '{{ final_state }}'
+  outcome: '{{ outcome }}'
+
+main:
+  task_name: job-machine
+  state_machine:
+    initial_state: working
+    event_source_topic: job_events
+    timeout_sec: 60
+    states:
+      # Start the job and wait here for its completion event.
+      - name: working
+        on_enter:
+          task_name: start-job
+          activity:
+            type: builtin.delay
+            input:
+              duration: '{{ job_seconds }}s'
+            options:
+              execute_locally: false
+              async_mode: true
+              async_event_topic: job_events   # == event_source_topic
+          output:
+            as: work_token#                   # the transitions below trigger on it
+
+      - name: succeeded
+        is_terminal: true
+
+      - name: failed
+        is_terminal: true
+
+    transitions:
+      # work_token was set by on_enter above; the expression is re-evaluated
+      # for every event arriving on job_events.
+      - from_state: working
+        to_state: succeeded
+        trigger:
+          event_type: '{{ work_token }}'
+          condition: '{{ event["metadata"]["status"] == "completed" }}'
+          action:
+            set:
+              - outcome#:
+                  status: completed
+                  result: '{{ event["data"] }}'
+
+      - from_state: working
+        to_state: failed
+        trigger:
+          event_type: '{{ work_token }}'
+          condition: '{{ event["metadata"]["status"] == "failed" }}'
+          action:
+            set:
+              - outcome#:
+                  status: failed
+                  error: '{{ event["metadata"].get("error") }}'
+  output:
+    as: final_state

@@ -1,0 +1,158 @@
+# Where values live and how they move between tasks.
+#
+# Values a workflow starts with:
+#   context:   initial variables, always present (values may be expressions)
+#   input:     declared parameters and their defaults; the caller's values win
+#
+# Where a task can write:
+#   name       the workflow context: every later task and the workflow `output`
+#   name@      the nearest container scope (see 07-container-scope-variable)
+#   _name      task-local: the rest of this task's `set` / `output`, then gone
+#
+# How a task publishes its result. `output` has three separate jobs, run in order:
+#   set        ordered writes, like a `set` task; `_` is the kind's raw result
+#   data       the task's result (default `_`); can read the locals from `set`
+#   as         store the result in one variable
+# Nothing is merged into the context implicitly: if a key should become a
+# variable, write it with `output.set`.
+#
+# The workflow's own `output` (below) is evaluated against the context once
+# `main` finishes; it is a mapping here, so the workflow returns a dict.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-data-flow
+  tags: [build-my-workflow, basics, level-2-data-flow]
+
+context:
+  # Always defined. A caller can still override it.
+  currency: USD
+  audit_trail: []
+
+input:
+  # Declared parameters. These are the defaults.
+  order_id: ORD-001
+  quantity: 3
+  unit_price: 19.99
+
+output:
+  order_id: '{{ order_id }}'
+  total: '{{ total }}'
+  currency: '{{ currency }}'
+  label: '{{ label }}'
+  resolved: '{{ resolved }}'
+  audit_trail: '{{ audit_trail }}'
+
+main:
+  tasks:
+    # --- task-local values ------------------------------------------------
+    # `_tax_rate` and `_subtotal` exist only inside this task. Only `total`
+    # reaches the workflow context.
+    - task_name: compute-total
+      set:
+        - _tax_rate: 0.08
+        - _subtotal: '{{ quantity * unit_price }}'
+        - total: '{{ round(_subtotal * (1 + _tax_rate), 2) }}'
+        - _t: '{{ audit_trail.append("computed total") }}'
+
+    # Proof: the locals are gone. `__context__` is the merged view of every
+    # visible variable, so `"x" in __context__` asks "is x defined here?".
+    - task_name: prove-locals-are-scoped
+      set:
+        - tax_rate_visible#: '{{ "_tax_rate" in __context__ }}'
+
+    # --- output.as: store the whole result --------------------------------
+    - task_name: resolve-by-as
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-data-flow-resolver
+            input:
+              code:
+            output:
+              label: 'order {{ code }}'
+              region: EMEA
+            main:
+              set: []
+        input:
+          code: '{{ order_id }}'
+      output:
+        as: resolved              # {label: ..., region: ...}
+
+    # --- output.set: pick values out of `_` --------------------------------
+    # `_` is the child's result. Only what `set` writes reaches the context.
+    - task_name: resolve-by-set
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-data-flow-resolver-2
+            input:
+              code:
+            output:
+              label: 'order {{ code }}'
+              region: EMEA
+            main:
+              set: []
+        input:
+          code: '{{ order_id }}'
+      output:
+        set:
+          - label: '{{ _["label"] }}'
+          - _t: '{{ audit_trail.append("resolved label") }}'
+
+    # --- output.data + as: reshape, then store -----------------------------
+    - task_name: resolve-and-reshape
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-data-flow-resolver-3
+            input:
+              code:
+            output:
+              label: 'order {{ code }}'
+              region: EMEA
+            main:
+              set: []
+        input:
+          code: '{{ order_id }}'
+      output:
+        set:
+          - _region: '{{ _["region"].lower() }}'
+        data:
+          title: '{{ _["label"].upper() }}'
+          region: '{{ _region }}'
+        as: reshaped#              # trailing `#` logs the stored value
+
+    # --- no shadowing ------------------------------------------------------
+    # The child returns a key called `currency`. Its keys are never bound as
+    # variables: the child's value is `_["currency"]`, while `currency` still
+    # reads the workflow context.
+    - task_name: no-shadowing
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-data-flow-fx
+            output:
+              currency: EUR
+            main:
+              set: []
+      output:
+        set:
+          - child_currency#: '{{ _["currency"] }}'    # EUR
+          - outer_currency#: '{{ currency }}'         # USD
+
+    # --- output on a container ---------------------------------------------
+    # A `tasks` container's `_` is the list of its children's results. Its
+    # `output` can replace that with any value, which is what the parent sees.
+    - task_name: summarise
+      tasks:
+        - task_name: build-parts
+          set:
+            - _t: '{{ audit_trail.append("summarised") }}'
+      output:
+        data: '{{ "order " + order_id + " total " + str(total) + " " + currency }}'
+        as: summary_line#

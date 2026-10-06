@@ -1,0 +1,123 @@
+# Reference sheet for how values are EVALUATED.
+# (Where values live is 04-data-flow; the narrative tour of the modifiers is
+# 06-variable-modifier. This file is the compact lookup table.)
+#
+# Everything inside {{ }} is a sandboxed Python expression. Text outside {{ }}
+# is literal, so a value can interleave both: 'Hi {{name}}, {{n}} items'.
+# A value that is exactly one {{ }} keeps its type (list, dict, number...).
+#
+# Variable name modifiers -- syntax: [_]name[@][#modifier...][#]
+#
+#   _name             task-local: the rest of this task's set / output only
+#   name@             store in the nearest container scope, not the context
+#   name#             log the value to the moco CLI (debug trace)
+#   name#literal      do NOT evaluate; keep the braces as text
+#   name#jinja        render as a Jinja2 template instead of a Python expression
+#   name#python_glom  evaluate as a glom path over __context__
+#   name#python       force Python evaluation (repeatable: #python#python)
+#
+# Names every expression can read:
+#   __context__       the merged view of all visible variables
+#   _                 inside `output`, the task's raw result
+#   __user_info__ / __sys_info__ / now() / uuid4()
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-expression
+  tags: [build-my-workflow, basics, level-2-data-flow]
+
+input:
+  name: Ada
+  prices: [15.99, 8.5, 25.0, 12.99, 5.0]
+  people:
+    - {name: Ada, dept: eng, salary: 120}
+    - {name: Bo, dept: ops, salary: 90}
+    - {name: Cy, dept: eng, salary: 110}
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- interpolation vs expression --------------------------------------
+    - task_name: interpolation
+      set:
+        - greeting#: 'Hi {{ name }}, you have {{ len(prices) }} items'
+        # No {{ }} at all -> a literal value, not an expression.
+        - status: pending
+
+    # --- the whitelisted builtins ------------------------------------------
+    - task_name: builtins
+      set:
+        - total#: '{{ round(sum(prices), 2) }}'
+        - count: '{{ len(prices) }}'
+        - cheapest: '{{ min(prices) }}'
+        - dearest: '{{ max(prices) }}'
+        - ranked: '{{ sorted(prices, reverse=True) }}'
+        - any_free: '{{ any(p == 0 for p in prices) }}'
+        - all_positive: '{{ all(p > 0 for p in prices) }}'
+        - doubled: '{{ [round(p * 2, 2) for p in prices] }}'
+        - numbered: '{{ [f"{i}:{p}" for i, p in enumerate(prices)] }}'
+        - as_int: '{{ int(sum(prices)) }}'
+        - as_text: '{{ str(len(prices)) + " items" }}'
+
+    # Comprehensions, grouping and dict building all work as in Python.
+    - task_name: collections
+      set:
+        - eng_names: '{{ [p["name"] for p in people if p["dept"] == "eng"] }}'
+        - by_dept: '{{ {d: [p["name"] for p in people if p["dept"] == d] for d in set(p["dept"] for p in people)} }}'
+        - payroll#: '{{ sum(p["salary"] for p in people) }}'
+        # A multi-line expression is fine; the whole block is one {{ }}.
+        - stats: |
+            {{
+              {
+                "headcount": len(people),
+                "avg_salary": round(sum(p["salary"] for p in people) / len(people), 1)
+              }
+            }}
+
+    # --- modifiers ----------------------------------------------------------
+    - task_name: modifiers
+      set:
+        # #literal keeps the braces as text -- useful for templates that are
+        # meant to be rendered later, or for documentation strings.
+        - template#literal: 'Hello {{ name }}'
+
+        # #jinja renders with Jinja2, which has statements (if/for) and
+        # filters -- things a single Python expression cannot express.
+        - roster#jinja: |
+            {% for p in people | sort(attribute='name') %}
+            - {{ p.name | upper }} ({{ p.dept }})
+            {% endfor %}
+
+        # #python_glom addresses nested data by path. The value is inlined
+        # into glom(__context__, <value>), so the path must be a quoted string --
+        # a bare people.0.dept is not valid Python and fails to parse.
+        - first_dept#python_glom: '"people.0.dept"'
+
+        # A task-local variable: computed once, used below, then discarded.
+        - _avg: '{{ sum(prices) / len(prices) }}'
+        - avg_price#: '{{ round(_avg, 2) }}'
+
+    - task_name: prove-local-discarded
+      set:
+        - avg_leaked#: '{{ "_avg" in __context__ }}'
+
+    # --- system context -----------------------------------------------------
+    - task_name: system-context
+      set:
+        - now#: '{{ now() }}'
+        - user_id: '{{ __user_info__.get("user_id") }}'
+        - workflow_id: '{{ __sys_info__.get("workflow_id") }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            greeting: '{{ greeting }}'
+            total: '{{ total }}'
+            avg_price: '{{ avg_price }}'
+            ranked: '{{ ranked }}'
+            by_dept: '{{ by_dept }}'
+            stats: '{{ stats }}'
+            template_kept_literal: '{{ template }}'
+            first_dept: '{{ first_dept }}'
+            roster: '{{ roster.strip() }}'

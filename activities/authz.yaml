@@ -1,0 +1,127 @@
+# The `authz.*` activities: Moco's evidence-based authorization engine.
+#
+#   authz.list_resources       resources in the system policy store
+#                              (filter by namespace / resource_id_pattern)
+#   authz.get_resource_policy  one resource's privileges and their grants
+#   authz.check_privilege      evaluate an action against a policy you pass in
+#                              -> true / false (raise_on_deny: true to fail instead)
+#   authz.impersonate_user     returns a user_info for run_as_user_id. For
+#                              yourself it always works; for anyone else it
+#                              needs sys.workflow:impersonate_user.
+#
+# A policy is {resource, items: [{privilege, grants}]}. A grant is a tree of
+# "key:value" evidence terms joined by relation AND / OR; the action is granted
+# if ANY grant matches. Evidence is filled in from the run (user_id, user_org,
+# tier, debug_mode, wfspec_name, caller_wfspec_name, is_impersonated) and
+# topped up with `extra_evidence` -- use that for request facts such as an
+# amount band or a target resource. Values may use * wildcards.
+#
+# This spec evaluates a made-up "act-demo.orders" policy passed inline:
+# nothing is written, and the system store is only read.
+#
+# NEEDS: nothing. Runs on both runtimes.
+#
+#   moco run authz.yaml
+#   moco run authz.yaml -i '{"amount_band": "large"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-authz
+  tags: [act-demo, authz]
+
+context:
+  orders_policy:
+    resource:
+      resource_id: act-demo.orders
+      namespace: act-demo
+      description: demo order approvals
+    items:
+      - privilege:
+          privilege_id: act-demo.orders:approve
+          resource_id: act-demo.orders
+          action: approve
+          description: approve an order
+        grants:
+          # anyone may approve small orders ...
+          - relation: AND
+            content: ['amount_band:small']
+          # ... large ones only in the dev tier from an act-* workflow
+          - relation: AND
+            content: ['amount_band:large', 'tier:dev', 'wfspec_name:act-*']
+
+input:
+  amount_band: small
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: whoami
+      set:
+        - user_id: '{{ __user_info__.get("user_id") }}'
+
+    # --- read the system policy store --------------------------------------------
+    - task_name: list-system-resources
+      activity:
+        type: authz.list_resources
+        input:
+          namespace: system
+      output:
+        set:
+          # (in-memory returns pydantic objects, Temporal returns dicts -- normalise)
+          - system_resources#: '{{ [(r if isinstance(r, dict) else r.model_dump()).get("resource_id") for r in _] }}'
+
+    - task_name: get-workflow-policy
+      activity:
+        type: authz.get_resource_policy
+        input:
+          resource_id: sys.workflow
+      output:
+        set:
+          - policy: '{{ _ if isinstance(_, dict) else _.model_dump() }}'
+          - workflow_actions#: '{{ [i["privilege"]["action"] for i in policy["items"]] }}'
+
+    # --- evaluate our own policy ----------------------------------------------------
+    - task_name: check-requested-band
+      activity:
+        type: authz.check_privilege
+        input:
+          resource_policy: '{{ orders_policy }}'
+          check_action: approve
+          extra_evidence:
+            amount_band: '{{ amount_band }}'
+      output:
+        set:
+          - granted#: '{{ _ }}'
+
+    - task_name: check-huge-band
+      activity:
+        type: authz.check_privilege
+        input:
+          resource_policy: '{{ orders_policy }}'
+          check_action: approve
+          extra_evidence:
+            amount_band: huge
+          raise_on_deny: false
+      output:
+        set:
+          - huge_granted#: '{{ _ }}'
+
+    # --- impersonation: yourself, which needs no privilege --------------------------
+    - task_name: impersonate-self
+      activity:
+        type: authz.impersonate_user
+        input:
+          run_as_user_id: '{{ user_id }}'
+      output:
+        as: self_user_info
+
+    - task_name: build-report
+      set:
+        - report:
+            system_resources: '{{ system_resources }}'
+            workflow_actions: '{{ workflow_actions }}'
+            amount_band: '{{ amount_band }}'
+            approve_granted: '{{ granted }}'
+            approve_huge_granted: '{{ huge_granted }}'
+            impersonated: '{{ self_user_info }}'

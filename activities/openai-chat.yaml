@@ -1,0 +1,184 @@
+# `openai.chat.completions` against any OpenAI-compatible endpoint.
+#
+#   apikey_secret_key  name of the secret holding the API key (never inline)
+#   base_url / model_name   default to MOCO_LLM_DEFAULT_BASE_URL / _MODEL_NAME
+#                      on the worker; base_url is used as-is, so include /v1
+#   messages           standard chat messages (system / user / assistant / tool)
+#   response_format    {type: json_object} for JSON mode
+#   tools / tool_choice    function calling
+#   max_tokens, temporature (sic -- that is the field's real spelling), stream,
+#   proxy              per-call proxy (the worker's MOCO_HTTP_PROXY is NOT applied)
+#
+# Output is the assistant message: {role, content, tool_calls, ...}.
+#
+# Three calls:
+#   1. plain chat
+#   2. JSON mode, parsed in the workflow
+#   3. tool calling: the model asks for get_weather, the WORKFLOW runs the
+#      "tool" (a transform here; any activity in practice) and sends the result
+#      back for the final answer -- the basic agent loop, one turn deep
+#
+# NEEDS: an LLM endpoint and its key in a secret. Defaults target the internal
+# gateway with MY_LLM_TOKEN. The error "token authentication failure for
+# principal ..." means that token has expired -- re-upload it; it is not a
+# problem with this spec. Any OpenAI-compatible endpoint works, e.g.
+#   moco run openai-chat.yaml -i '{"base_url": "https://api.openai.com/v1",
+#     "model_name": "gpt-4o-mini", "apikey_secret_key": "MY_OPENAI_APIKEY"}'
+#
+#   moco run openai-chat.yaml
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-openai-chat
+  tags: [act-demo, llm, requires-llm-token]
+
+input:
+  apikey_secret_key: MY_LLM_TOKEN
+  base_url: https://llm.dev.bloomberg.com/v1
+  model_name: dsp.gemma-4-26b
+  proxy:
+  city: Paris
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: llm-settings
+      set:
+        - llm:
+            apikey_secret_key: '{{ apikey_secret_key }}'
+            base_url: '{{ base_url }}'
+            model_name: '{{ model_name }}'
+            proxy: '{{ proxy }}'
+
+    # --- 1. plain chat ----------------------------------------------------------
+    - task_name: plain-chat
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: '{{ llm["apikey_secret_key"] }}'
+          base_url: '{{ llm["base_url"] }}'
+          model_name: '{{ llm["model_name"] }}'
+          proxy: '{{ llm["proxy"] }}'
+          max_tokens: 100
+          temporature: 0.2
+          messages:
+            - role: system
+              content: You answer in one short sentence.
+            - role: user
+              content: What is a workflow engine?
+        options:
+          retry_policy:
+            timeout_sec: 120
+            max_attempts: 2
+      output:
+        set:
+          - plain_answer#: '{{ (_.get("content") or "").strip() }}'
+
+    # --- 2. JSON mode -------------------------------------------------------------
+    - task_name: json-mode
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: '{{ llm["apikey_secret_key"] }}'
+          base_url: '{{ llm["base_url"] }}'
+          model_name: '{{ llm["model_name"] }}'
+          proxy: '{{ llm["proxy"] }}'
+          max_tokens: 200
+          response_format:
+            type: json_object
+          messages:
+            - role: system
+              content: 'Reply with JSON only: {"city": str, "country": str, "population_millions": number}'
+            - role: user
+              content: 'Facts about {{ city }}'
+        options:
+          retry_policy:
+            timeout_sec: 120
+            max_attempts: 2
+      output:
+        set:
+          - json_text: '{{ (_.get("content") or "").strip() }}'
+          # tolerate models that wrap the JSON in prose or code fences
+          - city_facts#: '{{ json.loads(json_text[json_text.find("{"):json_text.rfind("}") + 1]) }}'
+
+    # --- 3. tool calling ------------------------------------------------------------
+    - task_name: tool-setup
+      set:
+        - tools:
+            - type: function
+              function:
+                name: get_weather
+                description: Current weather for a city
+                parameters:
+                  type: object
+                  properties:
+                    city: {type: string}
+                  required: [city]
+        - conversation:
+            - role: user
+              content: 'Should I take an umbrella in {{ city }} today?'
+
+    - task_name: ask-with-tools
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: '{{ llm["apikey_secret_key"] }}'
+          base_url: '{{ llm["base_url"] }}'
+          model_name: '{{ llm["model_name"] }}'
+          proxy: '{{ llm["proxy"] }}'
+          max_tokens: 300
+          messages: '{{ conversation }}'
+          tools: '{{ tools }}'
+          tool_choice: required
+        options:
+          retry_policy:
+            timeout_sec: 120
+            max_attempts: 2
+      output:
+        as: tool_request
+
+    # The workflow executes the requested tool. A canned answer keeps this
+    # offline; swap in http.request for a real weather API.
+    - task_name: run-tool
+      set:
+        - tool_call#: '{{ (tool_request.get("tool_calls") or [None])[0] }}'
+        - tool_args: '{{ json.loads(tool_call["function"]["arguments"]) if tool_call else {} }}'
+        - tool_result:
+            city: '{{ tool_args.get("city", city) }}'
+            forecast: light rain from 3pm
+            chance_of_rain_pct: 80
+        - followup: >-
+            {{ conversation
+               + [{"role": "assistant", "content": tool_request.get("content") or "",
+                   "tool_calls": [tool_call]}]
+               + [{"role": "tool", "tool_call_id": tool_call["id"], "content": json.dumps(tool_result)}]
+               if tool_call else conversation }}
+    - task_name: final-answer
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: '{{ llm["apikey_secret_key"] }}'
+          base_url: '{{ llm["base_url"] }}'
+          model_name: '{{ llm["model_name"] }}'
+          proxy: '{{ llm["proxy"] }}'
+          max_tokens: 200
+          messages: '{{ followup }}'
+          tools: '{{ tools }}'
+        options:
+          retry_policy:
+            timeout_sec: 120
+            max_attempts: 2
+      output:
+        set:
+          - final_answer#: '{{ (_.get("content") or "").strip() }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            model: '{{ model_name }}'
+            plain_answer: '{{ plain_answer }}'
+            city_facts: '{{ city_facts }}'
+            tool_called: '{{ tool_call["function"]["name"] if tool_call else None }}'
+            tool_args: '{{ tool_args }}'
+            final_answer: '{{ final_answer }}'

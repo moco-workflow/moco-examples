@@ -1,0 +1,74 @@
+# The `@` (container scope) modifier in depth.
+#
+# Three scopes, innermost first:
+#   _name    task-local       the rest of this task only
+#   name@    container scope  the nearest enclosing `tasks` container or loop
+#                             iteration; later siblings (and their children) can
+#                             read it, and it is gone when that container ends
+#   name     workflow context visible everywhere afterwards
+#
+# Reads look innermost-first, so a container-scoped `discount@` shadows any
+# `discount` in the context for as long as the container runs.
+#
+# Every loop iteration opens a fresh container scope, so per-item temporaries
+# never clash between iterations and never leak out of the loop.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-container-scope-variable
+  tags: [build-my-workflow, basics, level-2-data-flow]
+
+output:
+  processed_orders: '{{ processed_orders }}'
+  summary: '{{ summary }}'
+  leaked: '{{ leaked }}'
+
+main:
+  tasks:
+    - set:
+        - orders:
+            - id: "order-1"
+              amount: 150.0
+              customer: "Alice"
+            - id: "order-2"
+              amount: 49.99
+              customer: "Bob"
+            - id: "order-3"
+              amount: 250.0
+              customer: "Carol"
+
+    # Each iteration computes its values in its own scope.
+    - task_name: process-orders
+      loop:
+        in: '{{ orders }}'
+        foreach: order              # `order` itself lives in the iteration scope
+        do:
+          tasks:
+            - set:
+                - _log#: "Processing {{ order['id'] }} for {{ order['customer'] }}"
+
+            # Without `@` this would be a context write, overwritten by each order.
+            - set:
+                - discount@: '{{ 0.10 if order["amount"] >= 100 else 0.0 }}'
+
+            - set:
+                - final_price@#: '{{ round(order["amount"] * (1 - discount), 2) }}'
+
+          # The iteration's result: built from the scoped values while they exist.
+          output:
+            data:
+              id: '{{ order["id"] }}'
+              customer: '{{ order["customer"] }}'
+              original: '{{ order["amount"] }}'
+              discount_pct: '{{ int(discount * 100) }}'
+              final: '{{ final_price }}'
+      output:
+        as: processed_orders        # the list of iteration results
+
+    # `order`, `discount` and `final_price` are gone; only `processed_orders` is left.
+    - set:
+        - leaked#: '{{ [n for n in ("order", "discount", "final_price") if n in __context__] }}'
+        - total_revenue#: '{{ sum(o["final"] for o in processed_orders) }}'
+        - summary#:
+            total_orders: '{{ len(processed_orders) }}'
+            total_revenue: '{{ total_revenue }}'

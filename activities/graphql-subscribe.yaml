@@ -1,0 +1,193 @@
+# `graphql.subscribe`: stream a GraphQL subscription into a workflow.
+#
+#   endpoint      ws:// or wss:// URL speaking the graphql-transport-ws protocol
+#                 (graphql-ws library, Apollo Server 3+, Hasura, ...). The older
+#                 subscriptions-transport-ws protocol is not supported.
+#   subscription  the subscription document
+#   variables     its variables
+#   headers       for the upgrade request (e.g. Authorization)
+#
+# Each `next` payload's `data` is relayed into the workflow as an event on
+# relay_topic / relay_event_type (event["data"] = the data dict). The activity
+# ends when the server completes the subscription or the workflow ends, so
+# start it with async_mode: true and consume events in a state machine.
+#
+# SELF-CONTAINED BY DEFAULT: with use_local_server: true the spec first starts
+# a minimal graphql-transport-ws server with shell.run (Python + `websockets`).
+# It does not execute GraphQL -- it acks the connection, then answers the
+# subscribe message with message_count `next` frames shaped like the
+# subscription below (echoing the `runId` variable) and a `complete`. Point
+# `endpoint` / `subscription` / `variables` at a real server to use one:
+#
+#   moco run graphql-subscribe.yaml -i '{"use_local_server": false,
+#     "endpoint": "wss://api.example.com/graphql",
+#     "subscription": "subscription { priceUpdated { symbol price } }"}'
+#
+# With a real server the machine ends at listen_timeout_sec unless an event
+# matches the `last` condition, so adapt that transition to your payload.
+#
+# NEEDS: python on the worker PATH with `websockets` (default mode), or network
+# access to `endpoint`. The GraphQL client does not use MOCO_HTTP_PROXY.
+#
+#   moco run graphql-subscribe.yaml
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-graphql-subscribe
+  tags: [act-demo, graphql]
+
+context:
+  received: {}
+  timed_out: false
+  # A fake graphql-transport-ws server: serves ONE subscription, then exits.
+  server_script#literal: |
+    python - <<'PY'
+    import asyncio, json, os
+    from websockets.asyncio.server import serve
+    port = int(os.environ["GQL_PORT"])
+    done = asyncio.Event()
+    async def handler(ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg["type"] == "connection_init":
+                await ws.send(json.dumps({"type": "connection_ack"}))
+            elif msg["type"] == "ping":
+                await ws.send(json.dumps({"type": "pong"}))
+            elif msg["type"] == "subscribe":
+                v = msg["payload"].get("variables") or {}
+                count = int(v.get("count", 3))
+                await asyncio.sleep(1)
+                for i in range(count):
+                    tick = {"runId": v.get("runId"), "seq": i, "last": i == count - 1}
+                    await ws.send(json.dumps({"id": msg["id"], "type": "next",
+                                              "payload": {"data": {"tick": tick}}}))
+                await ws.send(json.dumps({"id": msg["id"], "type": "complete"}))
+                done.set()
+    async def main():
+        async with serve(handler, "127.0.0.1", port, subprotocols=["graphql-transport-ws"]):
+            print(f"serving on {port}", flush=True)
+            await asyncio.wait_for(done.wait(), timeout=60)
+            await asyncio.sleep(1)
+    asyncio.run(main())
+    PY
+  # Polls until the server's port accepts connections (fails after ~30s).
+  wait_script#literal: |
+    python - <<'PY'
+    import os, socket, sys, time
+    port = int(os.environ["PORT"])
+    for _ in range(60):
+        try:
+            socket.create_connection(("127.0.0.1", port), 1).close()
+            sys.exit(0)
+        except OSError:
+            time.sleep(0.5)
+    sys.exit(f"port {port} never opened")
+    PY
+
+input:
+  use_local_server: true
+  port: 18766
+  endpoint:  # default: ws://127.0.0.1:<port>/graphql
+  subscription: |
+    subscription Ticks($runId: String!, $count: Int!) {
+      tick(runId: $runId, count: $count) { runId seq last }
+    }
+  variables: # default: {runId: <this run>, count: message_count}
+  message_count: 3
+  listen_timeout_sec: 30
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: ids
+      set:
+        - self_id: '{{ __sys_info__.get("workflow_id") or __sys_info__.get("trace_id") }}'
+        - run_id#: '{{ self_id[-12:] }}'
+        - gql_endpoint#: '{{ endpoint or "ws://127.0.0.1:" + str(port) + "/graphql" }}'
+        - gql_variables: '{{ variables if variables is not None else {"runId": run_id, "count": message_count} }}'
+
+    - task_name: graphql-stream
+      state_machine:
+        initial_state: start
+        event_source_topic: act_gql_relay
+        states:
+          - name: start
+            on_enter:
+              skip_if: '{{ not use_local_server }}'
+              tasks:
+                - task_name: start-local-server
+                  activity:
+                    type: shell.run
+                    input:
+                      # prefixed, not `env`: env would replace PATH too
+                      command: '{{ "GQL_PORT=" + str(int(port)) + " " + server_script }}'
+                      timeout: 90
+                    options:
+                      async_mode: true
+                # A regular activity (not local like builtin.delay), so the async
+                # server activity above is scheduled before this runs.
+                - task_name: wait-for-server
+                  activity:
+                    type: shell.run
+                    input:
+                      command: '{{ "PORT=" + str(int(port)) + " " + wait_script }}'
+                      check: true
+                      timeout: 40
+
+          - name: listen
+            timeout_sec: '{{ listen_timeout_sec }}'
+            on_enter:
+              task_name: subscribe
+              activity:
+                type: graphql.subscribe
+                input:
+                  endpoint: '{{ gql_endpoint }}'
+                  subscription: '{{ subscription }}'
+                  variables: '{{ gql_variables }}'
+                  relay_topic: act_gql_relay  # == event_source_topic
+                  relay_event_type: gql_data
+                  target_workflow_id: '{{ self_id }}'
+                options:
+                  async_mode: true
+
+          - name: done
+            is_terminal: true
+
+        transitions:
+          - from_state: start
+            to_state: listen
+            trigger: {}
+
+          - from_state: listen
+            trigger:
+              event_type: gql_data
+              condition: '{{ not event["data"].get("tick", {}).get("last") }}'
+              action:
+                set:
+                  - _t: '{{ received.update({event["data"].get("tick", {}).get("seq", len(received)): event["data"]}) }}'
+                  - payload#: '{{ event["data"] }}'
+
+          - from_state: listen
+            to_state: done
+            trigger:
+              event_type: gql_data
+              condition: '{{ event["data"].get("tick", {}).get("last") }}'
+              action:
+                set:
+                  - _t: '{{ received.update({event["data"]["tick"]["seq"]: event["data"]}) }}'
+
+          - from_state: listen
+            to_state: done
+            trigger:
+              event_type: sys.timer
+              action:
+                set:
+                  - timed_out#: true
+
+    - task_name: build-report
+      set:
+        - report:
+            endpoint: '{{ gql_endpoint }}'
+            received_count#: '{{ len(received) }}'
+            payloads: '{{ [received[k] for k in sorted(received)] }}'
+            timed_out: '{{ timed_out }}'

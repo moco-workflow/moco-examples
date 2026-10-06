@@ -1,0 +1,132 @@
+# The `langfuse.*` activities: LLM evaluation with Langfuse.
+#
+#   langfuse.create_score    attach scores to THIS workflow's trace (the target
+#                            is always the running trace). One score via
+#                            name/value/data_type, or a batch via `scores`.
+#                            Score ids are deterministic (trace + name), so a
+#                            retry or re-score upserts instead of duplicating.
+#   langfuse.run_experiment  offline evaluation: for every item in a Langfuse
+#                            DATASET, run the `task` wfspec on item.input, then
+#                            each `evaluator` wfspec on {input, output,
+#                            expected_output, metadata}; results are recorded
+#                            as a Langfuse experiment run. Task and evaluators
+#                            are wfspec references -- {name} of a published spec
+#                            or inline {content}, as used here.
+#
+# Credentials default to LANGFUSE_PUBLIC_KEY / _SECRET_KEY / _BASE_URL on the
+# worker (public_key / secret_key / base_url override them per call).
+#
+# run_experiment is OPT-IN (dataset_name: null skips it) because it needs a
+# dataset you own. Create one in the Langfuse UI -- e.g. "act-demo-uppercase" --
+# with items such as  input: {"text": "hello"}  expected_output: "HELLO".
+# The inline task uppercases input.text; the inline evaluator scores an exact
+# match. Task and evaluator runs are separate top-level workflows, so this part
+# needs the Temporal runtime.
+#
+# NEEDS: a Langfuse server + keys on the worker. For the experiment, a dataset.
+#
+#   moco run langfuse.yaml
+#   moco run langfuse.yaml -i '{"dataset_name": "act-demo-uppercase"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-langfuse
+  tags: [act-demo, llm-eval, requires-langfuse]
+
+context:
+  task_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-langfuse-task
+    input:
+      text: ''
+    output: '{{ result }}'
+    main:
+      set:
+        - result: '{{ text.upper() }}'
+  evaluator_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-langfuse-exact-match
+    input:
+      output:
+      expected_output:
+    output: '{{ evaluation }}'
+    main:
+      set:
+        - evaluation:
+            name: exact_match
+            value: '{{ 1.0 if output == expected_output else 0.0 }}'
+            comment: 'got {{ repr(output) }}, expected {{ repr(expected_output) }}'
+
+input:
+  dataset_name:
+  answer: Moco runs YAML workflows on Temporal or in memory.
+output: '{{ report }}'
+
+main:
+  tasks:
+    # A stand-in "judge": in real specs this is an openai.chat.completions call.
+    - task_name: judge
+      set:
+        - verdict#:
+            correctness: '{{ 0.9 if "Temporal" in answer else 0.3 }}'
+            tone: neutral
+            cites_sources: false
+
+    # --- single score -----------------------------------------------------------
+    - task_name: score-one
+      activity:
+        type: langfuse.create_score
+        input:
+          name: correctness
+          value: '{{ verdict["correctness"] }}'
+          data_type: NUMERIC
+          comment: stand-in judge from act-langfuse
+      output:
+        as: single_result
+
+    # --- a batch of scores, mixed types ---------------------------------------------
+    - task_name: score-batch
+      activity:
+        type: langfuse.create_score
+        input:
+          scores:
+            - name: tone
+              value: '{{ verdict["tone"] }}'
+              data_type: CATEGORICAL
+            - name: cites_sources
+              value: '{{ verdict["cites_sources"] }}'
+              data_type: BOOLEAN
+              metadata: {judge: act-langfuse}
+      output:
+        as: batch_result
+
+    # --- offline experiment over a dataset (opt-in) ---------------------------------
+    - task_name: experiment
+      skip_if: '{{ dataset_name is None }}'
+      activity:
+        type: langfuse.run_experiment
+        input:
+          dataset_name: '{{ dataset_name }}'
+          experiment_name: act-langfuse-uppercase
+          run_name: 'act-langfuse {{ now().strftime("%Y-%m-%d %H:%M:%S") }}'
+          task:
+            content: '{{ task_wfspec }}'
+          evaluators:
+            - content: '{{ evaluator_wfspec }}'
+          max_concurrency: 2
+        options:
+          retry_policy:
+            timeout_sec: 600
+            max_attempts: 1
+      output:
+        as: experiment_result
+
+    - task_name: build-report
+      set:
+        - report:
+            trace_id: '{{ __sys_info__.get("trace_id") }}'
+            single_result#: '{{ single_result }}'
+            batch_result#: '{{ batch_result }}'
+            experiment#: '{{ experiment_result if dataset_name is not None else "skipped (no dataset_name)" }}'

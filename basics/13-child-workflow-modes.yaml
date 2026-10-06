@@ -1,0 +1,158 @@
+# The `workflow` task, along its two axes.
+#
+# AXIS 1 -- where the child comes from (exactly one):
+#   ref             a published spec, by name. String or mapping form:
+#                     ref: basics-set                         same namespace + package, latest version
+#                     ref: /my-ns/basics/2.*/basics-set       namespace / package / version / name
+#                     ref: {namespace: my-ns, name: basics/basics-set, version: "2.*"}
+#   function        a function of this document (12-functions)
+#   contents        inline child documents, written as YAML right here (used below)
+#   contents_yaml   the same, as YAML text -- e.g. built at runtime (14-data-resolver)
+#
+# AXIS 2 -- mode:
+#
+#   inline     (default) runs INSIDE the parent's execution: same workflow_id, no
+#              separate history, no separate retries. Cheapest. The parent waits.
+#   sync       a genuinely separate workflow with its own derived id, history,
+#              retries and timeouts. The parent waits for the result.
+#   async      independent, started and NOT waited for. The parent carries on, and
+#              `_` is the child's workflow_id. Cancelled if the parent finishes
+#              first -- pair it with wait_for (15-events) when the result matters.
+#   detached   like async, but survives the parent. Use for fire-and-forget work
+#              that must outlive this run.
+#
+# WHAT inline DOES NOT MEAN: it does not share the parent's variables. Every
+# child, inline included, starts with a fresh context made only of its `input`.
+# The report below proves it -- both children come back with saw_parent_secret: false.
+#
+# So the inline/sync choice is about execution cost and isolation of FAILURE,
+# not about data. Reach for sync when the child needs its own retry policy
+# (`options.retry_policy`) or its own entry in the workflow history; inline otherwise.
+#
+# RUNTIME DIFFERENCE: on Temporal a sync child is a real child workflow and gets
+# its own id. The in-memory runtime does not create one, so sync_has_its_own_id
+# comes back false there. The data isolation above holds on both.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-child-workflow-modes
+  tags: [build-my-workflow, basics, level-4-composition]
+
+context:
+  # Neither child can see this -- that is the point. Proof in the report.
+  parent_secret: not-visible-to-any-child
+
+input:
+  # detached children outlive this workflow, so the demo leaves it off by
+  # default rather than leaking a background run on every execution.
+  run_detached: false
+  # Referencing a child by `ref` only works once this package has been
+  # published (`moco publish`). Off by default so the file runs from source.
+  use_registry: false
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- inline: runs inside the parent's own execution --------------------
+    - task_name: inline-child
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-child-workflow-modes-inline
+            output:
+              saw_parent_secret: '{{ "parent_secret" in __context__ }}'
+              # same id as the parent: this is not a separate workflow
+              wid: '{{ __sys_info__.get("workflow_id") }}'
+            main:
+              set: []
+        mode: inline              # the default; spelled out for the demo
+      output:
+        as: inline_result
+
+    # --- sync: a separate workflow, parent waits ---------------------------
+    # Same data isolation as inline, but a real child workflow: its id is
+    # derived from the parent's, and it gets its own history and retries.
+    - task_name: sync-child
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-child-workflow-modes-sync
+            input:
+              passed_in:
+            output:
+              saw_parent_secret: '{{ "parent_secret" in __context__ }}'
+              got_passed_in: '{{ passed_in }}'
+              wid: '{{ __sys_info__.get("workflow_id") }}'
+            main:
+              set: []
+        mode: sync
+        input:
+          passed_in: explicitly-passed
+      output:
+        as: sync_result
+
+    # --- referencing a published spec ---------------------------------------
+    # The other style: no inline content, resolved by name (and optionally a
+    # version pattern). Requires the spec to be published -- running a spec from
+    # source does not register it. Enable with use_registry=true after:
+    #   moco publish .
+    - task_name: call-by-ref
+      skip_if: '{{ not use_registry }}'
+      workflow:
+        ref: basics-set             # 02-set, from the same package
+        mode: sync
+      output:
+        as: by_name_result
+
+    # --- async: started, not waited for -----------------------------------
+    # There is no result to collect here. The child races the parent, and
+    # loses if the parent finishes first. To collect a result, have the child
+    # emit_event and wait_for it (15-events).
+    - task_name: async-child
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-child-workflow-modes-async
+            main:
+              task_name: background-work
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 1s
+        mode: async
+
+    # --- detached: outlives the parent ------------------------------------
+    # Off by default. Unlike async, this child is not cancelled when the
+    # parent completes, so its effect is not observable from within this run.
+    - task_name: detached-child
+      skip_if: '{{ not run_detached }}'
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-child-workflow-modes-detached
+            main:
+              task_name: long-background-work
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 5s
+        mode: detached
+
+    - task_name: build-report
+      set:
+        - _my_wid: '{{ __sys_info__.get("workflow_id") }}'
+        - report:
+            # neither child sees the parent's variables
+            inline_saw_parent_secret: '{{ inline_result["saw_parent_secret"] }}'
+            sync_saw_parent_secret: '{{ sync_result["saw_parent_secret"] }}'
+            # but only sync is a separate workflow
+            inline_shares_parent_id: '{{ inline_result["wid"] == _my_wid }}'
+            sync_has_its_own_id: '{{ sync_result["wid"] != _my_wid }}'
+            sync_got_passed_in: '{{ sync_result["got_passed_in"] }}'
+            by_name_result: '{{ by_name_result if "by_name_result" in __context__ else "skipped (use_registry=false)" }}'
+            detached_started: '{{ run_detached }}'

@@ -1,0 +1,381 @@
+# `builtin.deploy.auth.*`: the RBAC model, built up and torn down, with a
+# privilege check before and after each grant.
+#
+#   resource   something that can be protected, "<type>:<value>"   (wfspec:foo)
+#   privilege  an action on a resource, "<resource>:<action>"      (wfspec:foo:execute)
+#   role       a named bundle of privileges, owned by a namespace  (<ns>:<name>)
+#   member     a user or a group assigned to a role
+#
+# A user holds a privilege when it is in a role that has it -- directly, or
+# through a group they belong to. The spec grants through a GROUP to show that:
+#
+#   auth.resource.set / get / list -> auth.privilege.set / get / list
+#   auth.role.set / get
+#   check_user_privilege                            -> false (nothing granted)
+#   auth.role.privilege.add / list
+#   auth.role.member.add (the group) / list
+#   check_user_privilege + get_user_roles           -> true, via the group
+#   auth.role.member.remove -> check_user_privilege -> false again
+#   auth.role.privilege.remove
+#   cleanup: role.delete -> privilege.delete -> resource.delete -> group.delete
+#            -> user.delete -> namespace.delete
+#
+# SAFE BY CONSTRUCTION: everything -- namespace, user, group, resource, role --
+# is created by this run under an `act-scratch-<run id>` name and deleted
+# before it ends. The protected resource names a wfspec that does not exist,
+# so no real access changes hands. The exercise runs as an inline child with
+# catch_exception, so cleanup runs even when a step fails; the error is
+# re-raised afterwards.
+#
+# WARNING: builtin.deploy.* activities do NO authorization of their own (the
+# checks live in the sys.* wfspecs that normally wrap them). Pointed at real
+# names, a spec like this can grant anyone anything.
+#
+# NEEDS: the deployment DB (MOCO_DEPLOY_DB_CONN_STR on the worker, or on
+# moco-server for --in-memory). Runs on both runtimes.
+#
+#   moco run builtin-deploy-rbac.yaml
+#   moco run builtin-deploy-rbac.yaml -i '{"action": "read"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-deploy-rbac
+  tags: [act-demo, builtin, deploy, rbac]
+
+context:
+  exercise_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: act-builtin-deploy-rbac-exercise
+    input:
+      ids: {}
+      action:
+    output: '{{ report }}'
+    main:
+      tasks:
+        # --- principals: a user in a group, a namespace to own the role ------
+        - task_name: namespace-set
+          activity:
+            type: builtin.deploy.namespace.set
+            input:
+              namespace_id: '{{ ids["namespace"] }}'
+              namespace_name: '{{ ids["namespace"] }}'
+              description: scratch namespace from act-builtin-deploy-rbac
+        - task_name: user-set
+          activity:
+            type: builtin.deploy.user.set
+            input:
+              user_id: '{{ ids["user"] }}'
+              display_name: act-demo scratch user
+        - task_name: group-set
+          activity:
+            type: builtin.deploy.group.set
+            input: {name: '{{ ids["group"] }}'}
+          output:
+            set:
+              - group_id: '{{ _["id"] }}'
+        - task_name: group-member-add
+          activity:
+            type: builtin.deploy.group.member.add
+            input:
+              group_id: '{{ group_id }}'
+              member_user_id: '{{ ids["user"] }}'
+
+        # --- what is protected: resource -> privilege ------------------------
+        - task_name: resource-set
+          activity:
+            type: builtin.deploy.auth.resource.set
+            input:
+              resource_type: wfspec
+              resource_value: '{{ ids["wfspec"] }}'
+              description: a wfspec that does not exist -- nothing real is protected
+          output:
+            set:
+              - resource_id#: '{{ _["resource_id"] }}'
+        - task_name: resource-get
+          activity:
+            type: builtin.deploy.auth.resource.get
+            input:
+              resource_type: wfspec
+              resource_value: '{{ ids["wfspec"] }}'
+          output:
+            set:
+              - resource_found: '{{ _["resource_id"] == resource_id }}'
+        - task_name: resource-list
+          activity:
+            type: builtin.deploy.auth.resource.list
+            input: {resource_type: wfspec}
+          output:
+            set:
+              - wfspec_resource_count: '{{ len(_) }}'
+        - task_name: privilege-set
+          activity:
+            type: builtin.deploy.auth.privilege.set
+            input:
+              resource_id: '{{ resource_id }}'
+              action: '{{ action }}'
+              description: '{{ action }} the scratch wfspec'
+          output:
+            set:
+              - privilege_id#: '{{ _["privilege_id"] }}'
+        - task_name: privilege-get
+          activity:
+            type: builtin.deploy.auth.privilege.get
+            input:
+              resource_id: '{{ resource_id }}'
+              action: '{{ action }}'
+          output:
+            set:
+              - privilege_found: '{{ _["privilege_id"] == privilege_id }}'
+        - task_name: privilege-list
+          activity:
+            type: builtin.deploy.auth.privilege.list
+            input: {resource_id: '{{ resource_id }}'}
+          output:
+            set:
+              - resource_privileges: '{{ [p["privilege_id"] for p in _] }}'
+
+        # --- the role ------------------------------------------------------
+        - task_name: role-set
+          activity:
+            type: builtin.deploy.auth.role.set
+            input:
+              namespace_id: '{{ ids["namespace"] }}'
+              role_name: runners
+              description: may run the scratch wfspec
+          output:
+            set:
+              - role_id#: '{{ _["role_id"] }}'
+        - task_name: role-get
+          activity:
+            type: builtin.deploy.auth.role.get
+            input: {role_id: '{{ role_id }}'}
+          output:
+            set:
+              - role_name: '{{ _["role_name"] }}'
+
+        # --- grant, check, revoke -------------------------------------------
+        - task_name: check-before-grant
+          activity:
+            type: builtin.deploy.auth.check_user_privilege
+            input:
+              user_id: '{{ ids["user"] }}'
+              privilege_id: '{{ privilege_id }}'
+          output:
+            set:
+              - before_grant#: '{{ _["has_privilege"] }}'
+        - task_name: role-privilege-add
+          activity:
+            type: builtin.deploy.auth.role.privilege.add
+            input:
+              role_id: '{{ role_id }}'
+              privilege_id: '{{ privilege_id }}'
+        - task_name: role-privilege-list
+          activity:
+            type: builtin.deploy.auth.role.privilege.list
+            input: {role_id: '{{ role_id }}'}
+          output:
+            set:
+              - role_privileges: '{{ [p.get("privilege_id") for p in _] }}'
+        # grant through the GROUP, not the user
+        - task_name: role-member-add
+          activity:
+            type: builtin.deploy.auth.role.member.add
+            input:
+              role_id: '{{ role_id }}'
+              group_id: '{{ group_id }}'
+        - task_name: role-member-list
+          activity:
+            type: builtin.deploy.auth.role.member.list
+            input: {role_id: '{{ role_id }}'}
+          output:
+            set:
+              - role_members: >-
+                  {{ [("user:" + m["user_id"]) if m.get("user_id")
+                      else ("group:" + ids["group"] if m.get("group_id") == group_id else "group:" + str(m.get("group_id")))
+                      for m in _] }}
+        - task_name: check-after-grant
+          activity:
+            type: builtin.deploy.auth.check_user_privilege
+            input:
+              user_id: '{{ ids["user"] }}'
+              privilege_id: '{{ privilege_id }}'
+          output:
+            set:
+              - after_grant#: '{{ _["has_privilege"] }}'
+        - task_name: user-roles
+          activity:
+            type: builtin.deploy.auth.get_user_roles
+            input:
+              user_id: '{{ ids["user"] }}'
+              namespace_id: '{{ ids["namespace"] }}'
+          output:
+            set:
+              - user_roles: '{{ [r.get("role_id") for r in _] }}'
+        - task_name: role-member-remove
+          activity:
+            type: builtin.deploy.auth.role.member.remove
+            input:
+              role_id: '{{ role_id }}'
+              group_id: '{{ group_id }}'
+        - task_name: check-after-revoke
+          activity:
+            type: builtin.deploy.auth.check_user_privilege
+            input:
+              user_id: '{{ ids["user"] }}'
+              privilege_id: '{{ privilege_id }}'
+          output:
+            set:
+              - after_revoke#: '{{ _["has_privilege"] }}'
+        - task_name: role-privilege-remove
+          activity:
+            type: builtin.deploy.auth.role.privilege.remove
+            input:
+              role_id: '{{ role_id }}'
+              privilege_id: '{{ privilege_id }}'
+
+        - task_name: build-exercise-report
+          set:
+            - report:
+                result: ok
+                resource_id: '{{ resource_id }}'
+                resource_found_by_type_and_value: '{{ resource_found }}'
+                wfspec_resource_count: '{{ wfspec_resource_count }}'
+                privilege_id: '{{ privilege_id }}'
+                privilege_found_by_resource_and_action: '{{ privilege_found }}'
+                resource_privileges: '{{ resource_privileges }}'
+                role: '{{ role_id }} ({{ role_name }})'
+                role_privileges: '{{ role_privileges }}'
+                role_members: '{{ role_members }}'
+                user_roles_while_granted: '{{ user_roles }}'
+                has_privilege:
+                  before_grant: '{{ before_grant }}'
+                  after_grant_via_group: '{{ after_grant }}'
+                  after_revoke: '{{ after_revoke }}'
+
+input:
+  action: execute
+output: '{{ report }}'
+
+main:
+  tasks:
+    # Names are derived from this run's id: unique per run and stable on
+    # replay (a random() here would not be).
+    - task_name: scratch-names
+      set:
+        - _sfx: '{{ __sys_info__.get("workflow_id").split(":")[-1][:8] }}'
+        - ids#:
+            namespace: 'act-scratch-{{ _sfx }}'
+            wfspec: 'act-scratch-{{ _sfx }}-wf'
+            user: 'act-scratch-{{ _sfx }}-user'
+            group: 'act-scratch-{{ _sfx }}-group'
+        - role_id: 'act-scratch-{{ _sfx }}:runners'
+        - resource_id: 'wfspec:act-scratch-{{ _sfx }}-wf'
+        - privilege_id: 'wfspec:act-scratch-{{ _sfx }}-wf:{{ action }}'
+
+    - task_name: exercise
+      workflow:
+        contents_yaml: '{{ exercise_wfspec }}'
+        mode: inline
+        input:
+          ids: '{{ ids }}'
+          action: '{{ action }}'
+      output:
+        as: exercise
+      on_error:
+        catch: true
+        do:
+          set:
+            - _caught: "{{ {'result': 'error', **_} }}"
+          output:
+            data: '{{ _caught }}'
+            as: exercise
+
+    # --- cleanup: always runs. Look first, delete only what exists. -------
+    # Role before namespace (namespace.delete cascades roles, and a later
+    # role.delete would then fail); privilege before resource.
+    - task_name: cleanup-role-get
+      activity:
+        type: builtin.deploy.auth.role.get
+        input: {role_id: '{{ role_id }}'}
+      output:
+        as: leftover_role
+    - task_name: cleanup-role-delete
+      skip_if: '{{ leftover_role is None }}'
+      activity:
+        type: builtin.deploy.auth.role.delete
+        input: {role_id: '{{ role_id }}'}
+    - task_name: cleanup-privilege-get
+      activity:
+        type: builtin.deploy.auth.privilege.get
+        input: {privilege_id: '{{ privilege_id }}'}
+      output:
+        as: leftover_privilege
+    - task_name: cleanup-privilege-delete
+      skip_if: '{{ leftover_privilege is None }}'
+      activity:
+        type: builtin.deploy.auth.privilege.delete
+        input: {privilege_id: '{{ privilege_id }}'}
+    - task_name: cleanup-resource-get
+      activity:
+        type: builtin.deploy.auth.resource.get
+        input: {resource_id: '{{ resource_id }}'}
+      output:
+        as: leftover_resource
+    - task_name: cleanup-resource-delete
+      skip_if: '{{ leftover_resource is None }}'
+      activity:
+        type: builtin.deploy.auth.resource.delete
+        input: {resource_id: '{{ resource_id }}'}
+    - task_name: cleanup-group-get
+      activity:
+        type: builtin.deploy.group.get
+        input: {name: '{{ ids["group"] }}'}
+      output:
+        as: leftover_group
+    - task_name: cleanup-group-delete
+      skip_if: '{{ leftover_group is None }}'
+      activity:
+        type: builtin.deploy.group.delete
+        input: {group_id: '{{ leftover_group["id"] if leftover_group else "" }}'}
+    - task_name: cleanup-user-get
+      activity:
+        type: builtin.deploy.user.get
+        input: {user_id: '{{ ids["user"] }}'}
+      output:
+        as: leftover_user
+    - task_name: cleanup-user-delete
+      skip_if: '{{ leftover_user is None }}'
+      activity:
+        type: builtin.deploy.user.delete
+        input: {user_id: '{{ ids["user"] }}'}
+    - task_name: cleanup-namespace-get
+      activity:
+        type: builtin.deploy.namespace.get
+        input: {namespace_id: '{{ ids["namespace"] }}'}
+      output:
+        as: leftover_namespace
+    - task_name: cleanup-namespace-delete
+      skip_if: '{{ leftover_namespace is None }}'
+      activity:
+        type: builtin.deploy.namespace.delete
+        input: {namespace_id: '{{ ids["namespace"] }}'}
+
+    - task_name: build-report
+      set:
+        - report:
+            scratch_ids: '{{ ids }}'
+            exercise: '{{ exercise }}'
+            cleaned_up:
+              role: '{{ leftover_role is not None }}'
+              privilege: '{{ leftover_privilege is not None }}'
+              resource: '{{ leftover_resource is not None }}'
+              group: '{{ leftover_group is not None }}'
+              user: '{{ leftover_user is not None }}'
+              namespace: '{{ leftover_namespace is not None }}'
+
+    - task_name: reraise
+      raise:
+        if: '{{ isinstance(exercise, dict) and exercise.get("result") == "error" }}'
+        type: error
+        message: 'exercise failed (scratch data cleaned up): {{ exercise.get("error_message") }}'

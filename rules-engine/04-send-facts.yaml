@@ -1,0 +1,39 @@
+# The producer side of 03-live-rules-engine: push facts into a running rules session.
+#
+# A live session applies events that arrive on its `fact_source_topic` with
+# event_type `set_facts`, where `data` is a dict of fact -> value. Anything else is ignored.
+#
+#   moco start 03-live-rules-engine.yaml -i '{"simulate_feed": false}'
+#   moco run 04-send-facts.yaml -i '{"workflow_id": "<id>", "facts": {"cpu_pct": 97}}'
+#   moco run 04-send-facts.yaml -i '{"workflow_id": "<id>", "facts": {"p99_ms": 2000}}'
+#
+# Run with no workflow_id and it just explains itself instead of failing.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: re-send-facts
+  tags: [build-my-workflow, rules-engine, live]
+
+input:
+  workflow_id:  # the id printed by `moco start`
+  topic: health_metrics # must match the session's fact_source_topic
+  facts:
+    cpu_pct: 97
+
+output: '{{ sent }}'
+
+main:
+  tasks:
+    - task_name: push-facts
+      skip_if: '{{ not workflow_id }}'
+      emit_event:
+        topic: '{{ topic }}'
+        event_type: set_facts
+        target_workflow_id: '{{ workflow_id }}'
+        data: '{{ facts }}'
+
+    - task_name: report
+      set:
+        - sent#: >-
+            {{ f"sent {facts} to {workflow_id}" if workflow_id
+               else "nothing sent: pass -i '{\"workflow_id\": \"<id>\", \"facts\": {\"cpu_pct\": 97}}'" }}

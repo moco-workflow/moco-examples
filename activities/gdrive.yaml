@@ -1,0 +1,144 @@
+# All six `gdrive.*` activities, as a create -> use -> delete round trip that
+# touches only what this run created.
+#
+#   gdrive.list          search: parent_folder_id, name_contains, or a raw Drive
+#                        `query`; page_size / page_token for paging
+#   gdrive.create_folder skip_if_exists: true makes it idempotent
+#   gdrive.upload        from base64 `data` (or a worker-local file); pass
+#                        file_id to upload a new revision of an existing file
+#   gdrive.get_metadata  name, mime type, size, parents, ...
+#   gdrive.download      as base64 (default) or to a worker-local file; Google
+#                        Docs need export_mime_type
+#   gdrive.delete        to the trash by default; permanent: true to destroy
+#
+# Every call takes the same `auth` block: credentials_secret_key names a secret
+# holding a service-account key JSON (optionally impersonate_user for
+# domain-wide delegation).
+#
+# A service account has its own, EMPTY Drive with no storage quota, so uploads
+# normally need parent_folder_id: a folder (ideally on a shared drive) that has
+# been shared with the service account's email. The scratch folder and file
+# are created under it and removed again (cleanup: false keeps them).
+#
+# NEEDS: a service-account key in a secret (default GDRIVE_SERVICE_ACCOUNT), a
+# parent folder shared with it, and outbound HTTPS to googleapis.com from the
+# worker (the Drive client does not use MOCO_HTTP_PROXY). For the full tour,
+# including the local-file mode, see ../../../moco-examples/gdrive-demo.
+#
+#   moco run gdrive.yaml -i '{"parent_folder_id": "<folder id from the Drive URL>"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-gdrive
+  tags: [act-demo, gdrive, requires-gdrive-credentials]
+
+input:
+  credentials_secret_key: GDRIVE_SERVICE_ACCOUNT
+  impersonate_user:
+  parent_folder_id:
+  folder_name: act-gdrive-scratch
+  cleanup: true
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: prepare
+      set:
+        - auth:
+            credentials_secret_key: '{{ credentials_secret_key }}'
+            impersonate_user: '{{ impersonate_user }}'
+        - file_text: 'written by act-gdrive at {{ now().isoformat() }}'
+        - file_b64: '{{ base64.b64encode(file_text.encode()).decode() }}'
+
+    - task_name: list-visible
+      activity:
+        type: gdrive.list
+        input:
+          auth: '{{ auth }}'
+          parent_folder_id: '{{ parent_folder_id }}'
+          page_size: 10
+          order_by: modifiedTime desc
+      output:
+        set:
+          - visible#: '{{ [f["name"] for f in _["files"]] }}'
+
+    - task_name: create-folder
+      activity:
+        type: gdrive.create_folder
+        input:
+          auth: '{{ auth }}'
+          name: '{{ folder_name }}'
+          parent_folder_id: '{{ parent_folder_id }}'
+          skip_if_exists: true
+      output:
+        set:
+          - folder_id#: '{{ _["folder"]["file_id"] }}'
+          - folder_created: '{{ _["created"] }}'
+
+    - task_name: upload
+      activity:
+        type: gdrive.upload
+        input:
+          auth: '{{ auth }}'
+          name: act-gdrive-note.txt
+          parent_folder_id: '{{ folder_id }}'
+          source_format: base64
+          data: '{{ file_b64 }}'
+          mime_type: text/plain
+          description: scratch file from the act-gdrive example
+      output:
+        set:
+          - file_id#: '{{ _["file_id"] }}'
+
+    - task_name: get-metadata
+      activity:
+        type: gdrive.get_metadata
+        input:
+          auth: '{{ auth }}'
+          file_id: '{{ file_id }}'
+      output:
+        as: metadata
+
+    - task_name: download
+      activity:
+        type: gdrive.download
+        input:
+          auth: '{{ auth }}'
+          file_id: '{{ file_id }}'
+          output_format: base64
+      output:
+        set:
+          - downloaded_text: '{{ base64.b64decode(_["data"]).decode() }}'
+          - round_tripped#: '{{ downloaded_text == file_text }}'
+
+    # --- clean up: only what this run created -------------------------------
+    - task_name: cleanup
+      skip_if: '{{ not cleanup }}'
+      tasks:
+        - task_name: trash-file
+          activity:
+            type: gdrive.delete
+            input:
+              auth: '{{ auth }}'
+              file_id: '{{ file_id }}'
+        # the folder only if this run created it (skip_if_exists may have
+        # returned a pre-existing one)
+        - task_name: trash-folder
+          skip_if: '{{ not folder_created }}'
+          activity:
+            type: gdrive.delete
+            input:
+              auth: '{{ auth }}'
+              file_id: '{{ folder_id }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            visible_files: '{{ visible }}'
+            folder_id: '{{ folder_id }}'
+            folder_created: '{{ folder_created }}'
+            file_id: '{{ file_id }}'
+            metadata: '{{ metadata }}'
+            round_tripped: '{{ round_tripped }}'
+            cleaned_up: '{{ cleanup }}'

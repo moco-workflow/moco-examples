@@ -1,0 +1,74 @@
+# The `builtin.event.*` activities: publish observability events by hand.
+#
+#   builtin.event.emit_debug_event   push a DebugEvent onto this run's debug
+#                                    feed (RabbitMQ, topic "<trace_id>:debug") --
+#                                    the same feed the trailing-`#` traces and
+#                                    the UI trace viewer read.
+#   builtin.event.emit_metric_event  push a MetricEvent to Kafka
+#                                    (MOCO_METRICS_TOPIC on MOCO_METRICS_BROKER).
+#                                    Blank fields (trace_id, wfspec_name, user_id,
+#                                    timestamp, ...) are filled in from the run.
+#
+# Both are fire-and-forget and return None. If the backing bus is not
+# configured on the worker they log a warning and skip -- the spec still
+# succeeds, which is what makes it safe to leave metrics calls in a spec.
+#
+# These are NOT the workflow event bus. To signal another workflow use the
+# `emit_event` statement; to wait for one, `wait_for`.
+#
+# NEEDS: nothing to succeed. To actually see the events: RabbitMQ debug bus
+# (debug event) and MOCO_METRICS_TOPIC + a Kafka broker (metric event).
+#
+#   moco run builtin-event.yaml
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-event
+  tags: [act-demo, builtin]
+
+input:
+  metric_name: act_demo_orders_processed
+  metric_value: 42
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: resolve-ids
+      set:
+        - workflow_id#: '{{ __sys_info__.get("workflow_id") or __sys_info__.get("trace_id") }}'
+
+    - task_name: emit-debug
+      activity:
+        type: builtin.event.emit_debug_event
+        input:
+          event_type: data_log
+          workflow_id: '{{ workflow_id }}'
+          # data_log events are rendered by the CLI as "[var_name] value",
+          # exactly like a trailing-# trace
+          event_data:
+            var_name: hand_written_debug_event
+            value:
+              message: emitted by builtin.event.emit_debug_event
+              metric_name: '{{ metric_name }}'
+      output:
+        as: debug_result
+
+    - task_name: emit-metric
+      activity:
+        type: builtin.event.emit_metric_event
+        input:
+          event_type: '{{ metric_name }}'
+          event_value: '{{ metric_value }}'
+          properties:
+            source: act-builtin-event
+      output:
+        as: metric_result
+
+    - task_name: build-report
+      set:
+        - report:
+            workflow_id: '{{ workflow_id }}'
+            debug_result: '{{ debug_result }}'
+            # None when the metrics bus is not configured (skipped)
+            metric_result#: '{{ metric_result }}'

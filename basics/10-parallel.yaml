@@ -1,0 +1,69 @@
+# Running tasks concurrently: a `tasks` container with `props.execute_mode: parallel`.
+#
+#   props:
+#     execute_mode: parallel   start every child at once
+#     join_type: all           (default) wait for all; the result is the list of
+#                              child results in declaration order, and the
+#                              container fails if any child fails
+#     join_type: any           the first child to succeed wins; the rest are cancelled
+#
+# Each child runs against its own copy of the enclosing scopes, so siblings cannot
+# see each other's `@` writes. Context writes are applied as children finish.
+# (To run the iterations of a loop in parallel, use `loop.execute_mode`: 09-loop.)
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-parallel
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+output: '{{ summary }}'
+
+main:
+  tasks:
+    - set:
+        - _log#: "Starting parallel branches..."
+
+    - task_name: fetch-data-in-parallel
+      props:
+        execute_mode: parallel
+        join_type: all
+      tasks:
+        # Each branch is itself a sequential `tasks` container.
+        - task_name: branch-a
+          tasks:
+            - set:
+                - _log#: "Branch A: simulating fast task"
+            - task_name: branch-a-delay
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 1s
+          output:
+            data: "fast task done at {{ now() }}"
+
+        - task_name: branch-b
+          tasks:
+            - set:
+                - _log#: "Branch B: simulating slow task"
+            - task_name: branch-b-delay
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 2s
+          output:
+            data: "slow task done at {{ now() }}"
+
+        # A single task needs no container.
+        - task_name: branch-c
+          set:
+            - _done: "instant transform done at {{ now() }}"
+          output:
+            data: '{{ _done }}'
+
+      output:
+        as: parallel_results        # [branch-a, branch-b, branch-c], in declaration order
+
+    - set:
+        - summary:
+            message: "All branches completed"
+            results: '{{ parallel_results }}'

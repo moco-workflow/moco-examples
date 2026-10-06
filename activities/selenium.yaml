@@ -1,0 +1,278 @@
+# The `selenium.*` activities: drive Chrome through WebDriver, step by step.
+#
+#   browser.create / get_info / close   a session lives on the WORKER that
+#                     created it; later calls pass its session_id. Always close.
+#   nav.*             goto, back, forward, refresh
+#   element.*         find (one or all), type, clear, click, get_text,
+#                     get_attribute, get_property, is_visible, is_enabled
+#   page.*            get_title, get_url, get_html, execute_script (JS with
+#                     args), screenshot (base64, or a file on the worker)
+#   wait.*            element (present / visible / clickable), time
+#   selector          {type: css | xpath | id | name | class_name | tag_name, value}
+#
+# OFFLINE BY DEFAULT: the pages are data: URLs built inside the workflow.
+# Point `external_url` at a real site to add one live navigation (it uses
+# MOCO_HTTP_PROXY when set).
+#
+# NEEDS: Chrome + chromedriver on the worker host (MOCO_CHROME_PATH /
+# MOCO_CHROME_DRIVER_PATH, or on PATH), and a single worker -- the session is
+# held in that worker's memory.
+#
+#   moco run selenium.yaml
+#   moco run selenium.yaml -i '{"external_url": "https://example.com"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-selenium
+  tags: [act-demo, browser, requires-chrome]
+
+context:
+  form_html: >-
+    <html><head><title>Act Demo Form</title></head><body> <h1 id="heading">Order form</h1> <input id="name" name="name" placeholder="your name"> <select id="color"><option value="red">Red</option><option value="blue">Blue</option></select> <button id="go" onclick="document.getElementById('out').textContent =
+      'Hello ' + document.getElementById('name').value + ' (' + document.getElementById('color').value + ')'">Go</button>
+    <button id="locked" disabled>Disabled</button> <ul><li class="item">one</li><li class="item">two</li><li class="item">three</li></ul> <p id="out"></p> <a id="docs" href="https://example.com/docs">docs</a> </body></html>
+  second_html: <html><head><title>Second Page</title></head><body><p>second</p></body></html>
+
+input:
+  your_name: Ada
+  external_url:
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: build-pages
+      set:
+        - form_url: '{{ "data:text/html;base64," + base64.b64encode(form_html.encode()).decode() }}'
+        - second_url: '{{ "data:text/html;base64," + base64.b64encode(second_html.encode()).decode() }}'
+
+    - task_name: create
+      activity:
+        type: selenium.browser.create
+        input:
+          browser_type: chrome
+          options: {headless: true, window_width: 1280, window_height: 800, no_sandbox: true}
+      output:
+        set:
+          - sid: '{{ _["session_id"] }}'
+
+    - task_name: info
+      activity:
+        type: selenium.browser.get_info
+        input: {session_id: '{{ sid }}'}
+      output:
+        as: browser_info
+
+    # --- navigation + waits ----------------------------------------------------------
+    - task_name: goto-form
+      activity:
+        type: selenium.nav.goto
+        input: {session_id: '{{ sid }}', url: '{{ form_url }}'}
+      output:
+        set:
+          - goto_status: '{{ _["status"] }}'
+    - task_name: wait-heading
+      activity:
+        type: selenium.wait.element
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: heading}
+          condition: visible
+          timeout: 5
+    - task_name: title
+      activity:
+        type: selenium.page.get_title
+        input: {session_id: '{{ sid }}'}
+      output:
+        set:
+          - title#: '{{ _["title"] }}'
+
+    # --- elements ------------------------------------------------------------------------
+    - task_name: type-placeholder
+      activity:
+        type: selenium.element.type
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: name, value: name}
+          text: placeholder
+    - task_name: clear-name
+      activity:
+        type: selenium.element.clear
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: name}
+    - task_name: type-name
+      activity:
+        type: selenium.element.type
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: css, value: '#name'}
+          text: '{{ your_name }}'
+          clear_first: true
+    # no dedicated "select" activity -- set the <select> with a script
+    - task_name: pick-color
+      activity:
+        type: selenium.page.execute_script
+        input:
+          session_id: '{{ sid }}'
+          script: 'document.getElementById(arguments[0]).value = arguments[1]; return arguments[1];'
+          args: [color, blue]
+    - task_name: click-go
+      activity:
+        type: selenium.element.click
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: xpath, value: '//button[text()="Go"]'}
+    - task_name: read-output
+      activity:
+        type: selenium.element.get_text
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: out}
+      output:
+        set:
+          - greeting#: '{{ _["text"] }}'
+    - task_name: link-href
+      activity:
+        type: selenium.element.get_attribute
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: docs}
+          attribute_name: href
+      output:
+        set:
+          - href: '{{ _["value"] }}'
+    - task_name: input-value-property
+      activity:
+        type: selenium.element.get_property
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: name}
+          property_name: value
+      output:
+        set:
+          - name_value: '{{ _["value"] }}'
+    - task_name: out-visible
+      activity:
+        type: selenium.element.is_visible
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: out}
+      output:
+        set:
+          - out_visible: '{{ _["visible"] }}'
+    - task_name: locked-enabled
+      activity:
+        type: selenium.element.is_enabled
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: id, value: locked}  # not "off": YAML reads that as false
+      output:
+        set:
+          - off_enabled: '{{ _["enabled"] }}'
+    - task_name: find-items
+      activity:
+        type: selenium.element.find
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: class_name, value: item}
+          multiple: true
+      output:
+        set:
+          - items#: '{{ [e["text"] for e in (_["elements"] or [])] }}'
+    - task_name: find-missing
+      activity:
+        type: selenium.element.find
+        input:
+          session_id: '{{ sid }}'
+          selector: {type: tag_name, value: table}
+          wait_timeout: 1
+      output:
+        set:
+          - table_found: '{{ _["found"] }}'
+
+    # --- page-level reads -----------------------------------------------------------------
+    - task_name: html
+      activity:
+        type: selenium.page.get_html
+        input: {session_id: '{{ sid }}'}
+      output:
+        set:
+          - html_length: '{{ len(_["html"]) }}'
+    - task_name: screenshot
+      activity:
+        type: selenium.page.screenshot
+        input:
+          session_id: '{{ sid }}'
+          output_format: base64
+      output:
+        set:
+          - screenshot_b64_chars: '{{ len(_["data"]) }}'
+
+    # --- history -------------------------------------------------------------------------------
+    - task_name: goto-second
+      activity:
+        type: selenium.nav.goto
+        input: {session_id: '{{ sid }}', url: '{{ second_url }}'}
+    - task_name: back
+      activity:
+        type: selenium.nav.back
+        input: {session_id: '{{ sid }}'}
+    - task_name: forward
+      activity:
+        type: selenium.nav.forward
+        input: {session_id: '{{ sid }}'}
+    - task_name: refresh
+      activity:
+        type: selenium.nav.refresh
+        input: {session_id: '{{ sid }}'}
+    - task_name: pause
+      activity:
+        type: selenium.wait.time
+        input: {session_id: '{{ sid }}', seconds: 0.2}
+    - task_name: current-url
+      activity:
+        type: selenium.page.get_url
+        input: {session_id: '{{ sid }}'}
+      output:
+        set:
+          - ended_on_second: '{{ _["url"] == second_url }}'
+
+    # --- optional live site ---------------------------------------------------------------------
+    - task_name: live-site
+      skip_if: '{{ external_url is None }}'
+      tasks:
+        - task_name: goto-external
+          activity:
+            type: selenium.nav.goto
+            input: {session_id: '{{ sid }}', url: '{{ external_url }}'}
+        - task_name: external-title
+          activity:
+            type: selenium.page.get_title
+            input: {session_id: '{{ sid }}'}
+          output:
+            set:
+              - external_title#: '{{ _["title"] }}'
+
+    - task_name: close
+      activity:
+        type: selenium.browser.close
+        input: {session_id: '{{ sid }}'}
+
+    - task_name: build-report
+      set:
+        - report:
+            browser: '{{ browser_info }}'
+            goto_status: '{{ goto_status }}'
+            title: '{{ title }}'
+            greeting: '{{ greeting }}'
+            href: '{{ href }}'
+            name_value: '{{ name_value }}'
+            out_visible: '{{ out_visible }}'
+            disabled_button_enabled: '{{ off_enabled }}'
+            items: '{{ items }}'
+            table_found: '{{ table_found }}'
+            html_length: '{{ html_length }}'
+            screenshot_b64_chars: '{{ screenshot_b64_chars }}'
+            ended_on_second: '{{ ended_on_second }}'
+            external_title: '{{ external_title if external_url is not None else None }}'

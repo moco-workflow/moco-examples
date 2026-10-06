@@ -1,0 +1,242 @@
+# Human-in-the-loop: an expense approval that parks until a person decides.
+#
+#   submitted --(amount <= auto_approve_limit)--> auto_approved
+#             --(otherwise)--------------------> awaiting_approval
+#
+#   awaiting_approval --approve-------------------> approved
+#                     --reject--------------------> rejected
+#                     --add_comment---------------> (stays; comment recorded)
+#                     --sys.timer.reminder--------> (stays; reminder logged)
+#                     --sys.timer.reminder.final--> expired
+#
+# What it teaches:
+#   - event-driven transitions: `trigger.event_type` blocks the machine until a matching
+#     event arrives on `event_source_topic`
+#   - reading the event payload: triggers see the incoming event as `event`, so
+#     `event["data"]` carries the human's decision into the transition action
+#   - internal transitions (empty `to_state`) that handle an event without leaving the state
+#   - a named timer with `max_timeout_attempts`: it fires `sys.timer.reminder` on each lapse
+#     and `sys.timer.reminder.final` once the attempts run out -- the escalation path, so a
+#     request nobody answers cannot hang forever
+#
+# HOW TO RUN
+#
+#   1. Hands-off (default): `simulate_approver: true` starts an async child that plays the
+#      approver -- it waits a few seconds, then sends `simulated_decision` to this workflow.
+#
+#        moco run 04-human-in-the-loop.yaml
+#        moco run 04-human-in-the-loop.yaml -i '{"simulated_decision": "reject"}'
+#        moco run 04-human-in-the-loop.yaml -i '{"expense": {"id": "EXP-7", "amount": 90, "submitter": "sam", "description": "taxi"}}'
+#
+#   2. A real human: start it without the simulator, then send the decision yourself with
+#      05-send-decision.yaml, using the workflow id `moco start` prints.
+#
+#        moco start 04-human-in-the-loop.yaml -i '{"simulate_approver": false}'
+#        moco run 05-send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "add_comment", "comment": "receipt?"}'
+#        moco run 05-send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "approve", "comment": "ok"}'
+#        moco status <id>
+#
+#      Nobody answers? After 3 reminders of `reminder_sec` each it expires.
+#
+# Emitting to yourself from on_enter races the machine arming its transitions, which is why
+# the simulator is an async child with a delay rather than an emit_event right here.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-human-in-the-loop
+  tags: [build-my-workflow, state-machine, human-in-the-loop]
+
+context:
+  self_id:
+  status: submitted
+  decided_by:
+  comments: []
+  audit: []
+
+  # The simulated approver: waits, then emits a decision back to the parent.
+  approver_wfspec#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: sm-human-in-the-loop-approver
+    input:
+      target_workflow_id:
+      decision:
+      delay:
+    main:
+      tasks:
+        - task_name: think-it-over
+          activity:
+            type: builtin.delay
+            input:
+              duration: '{{ delay }}'
+        - task_name: send-comment
+          emit_event:
+            topic: approvals
+            event_type: add_comment
+            target_workflow_id: '{{ target_workflow_id }}'
+            data:
+              approver: simulated-manager
+              comment: looked at the receipt
+        - task_name: pause
+          activity:
+            type: builtin.delay
+            input:
+              duration: 1s
+        - task_name: send-decision
+          emit_event:
+            topic: approvals
+            event_type: '{{ decision }}'
+            target_workflow_id: '{{ target_workflow_id }}'
+            data:
+              approver: simulated-manager
+              comment: '{{ "within budget" if decision == "approve" else "over budget" }}'
+
+input:
+  expense:
+    id: EXP-1001
+    amount: 2500
+    submitter: jon doe
+    description: team offsite venue deposit
+  auto_approve_limit: 500
+  # Escalation: remind every reminder_sec; the reminder timer below expires the request
+  # after its max_timeout_attempts (3 -- must be a literal, not an expression).
+  reminder_sec: 30
+  # Stand-in for the human, so the spec completes on its own. Turn off for a real approver.
+  simulate_approver: true
+  simulated_decision: approve  # approve | reject
+  simulated_delay: 3s
+output: '{{ result }}'
+
+main:
+  tasks:
+    - task_name: resolve-self-id
+      set:
+        - self_id#: '{{ __sys_info__.get("workflow_id") }}'
+
+    - task_name: expense-approval
+      state_machine:
+        initial_state: submitted
+        # Human decisions arrive on this topic, addressed to this workflow's id.
+        event_source_topic: approvals
+        states:
+          - name: submitted
+            on_enter:
+              set:
+                - _log#: 'expense {{ expense["id"] }}: ${{ expense["amount"] }} from {{ expense["submitter"] }}'
+                - _t: '{{ audit.append("submitted") }}'
+
+          - name: awaiting_approval
+            timers:
+              - name: reminder
+                timeout_sec: '{{ reminder_sec }}'
+                max_timeout_attempts: 3
+            on_enter:
+              tasks:
+                - set:
+                    - status: awaiting_approval
+                    - _t: '{{ audit.append("awaiting_approval") }}'
+                    - _how_to_decide#: >-
+                        waiting for a human decision. Send one with: moco run 05-send-decision.yaml -i '{"workflow_id": "{{ self_id }}", "event_type": "approve"}'
+                - task_name: start-simulated-approver
+                  skip_if: '{{ not simulate_approver }}'
+                  workflow:
+                    contents_yaml: '{{ approver_wfspec }}'
+                    mode: async
+                    input:
+                      target_workflow_id: '{{ self_id }}'
+                      decision: '{{ simulated_decision }}'
+                      delay: '{{ simulated_delay }}'
+
+          - name: auto_approved
+            is_terminal: true
+            on_enter:
+              set:
+                - status#: auto_approved
+                - decided_by: system
+                - _t: '{{ audit.append("auto_approved") }}'
+
+          - name: approved
+            is_terminal: true
+            on_enter:
+              set:
+                - status#: approved
+                - _t: '{{ audit.append("approved by " + str(decided_by)) }}'
+
+          - name: rejected
+            is_terminal: true
+            on_enter:
+              set:
+                - status#: rejected
+                - _t: '{{ audit.append("rejected by " + str(decided_by)) }}'
+
+          - name: expired
+            is_terminal: true
+            on_enter:
+              set:
+                - status#: expired
+                - _t: '{{ audit.append("expired: no decision after 3 reminders") }}'
+
+        transitions:
+          # --- automatic routing ---------------------------------------------
+          - from_state: submitted
+            to_state: auto_approved
+            trigger:
+              condition: '{{ expense["amount"] <= auto_approve_limit }}'
+
+          - from_state: submitted
+            to_state: awaiting_approval
+            trigger:
+              condition: '{{ expense["amount"] > auto_approve_limit }}'
+
+          # --- the human's decision ------------------------------------------
+          - from_state: awaiting_approval
+            to_state: approved
+            trigger:
+              event_type: approve
+              action:
+                set:
+                  - decided_by#: '{{ event["data"].get("approver", "unknown") }}'
+                  - _c: '{{ comments.append(event["data"].get("comment")) if event["data"].get("comment") else None }}'
+
+          - from_state: awaiting_approval
+            to_state: rejected
+            trigger:
+              event_type: reject
+              action:
+                set:
+                  - decided_by#: '{{ event["data"].get("approver", "unknown") }}'
+                  - _c: '{{ comments.append(event["data"].get("comment")) if event["data"].get("comment") else None }}'
+
+          # Internal transition: record the comment, keep waiting.
+          - from_state: awaiting_approval
+            to_state:
+            trigger:
+              event_type: add_comment
+              action:
+                set:
+                  - comment#: '{{ event["data"].get("approver", "unknown") }}: {{ event["data"].get("comment") }}'
+                  - _c: '{{ comments.append(comment) }}'
+
+          # --- escalation ----------------------------------------------------
+          - from_state: awaiting_approval
+            to_state:
+            trigger:
+              event_type: sys.timer.reminder
+              action:
+                set:
+                  - _reminder#: 'reminder: expense {{ expense["id"] }} still needs a decision ({{ self_id }})'
+
+          - from_state: awaiting_approval
+            to_state: expired
+            trigger:
+              event_type: sys.timer.reminder.final
+
+    - task_name: build-result
+      set:
+        - result:
+            expense_id: '{{ expense["id"] }}'
+            amount: '{{ expense["amount"] }}'
+            status: '{{ status }}'
+            decided_by: '{{ decided_by }}'
+            comments: '{{ comments }}'
+            audit: '{{ audit }}'

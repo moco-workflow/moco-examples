@@ -1,0 +1,224 @@
+# All eight `k8s.*` activities, as a round trip on ONE Deployment that this run
+# creates and then deletes. Nothing pre-existing is modified or deleted.
+#
+#   k8s.list    list a kind (label_selector / field_selector / all_namespaces)
+#   k8s.apply   server-side apply of a manifest (dict, list, or YAML string)
+#   k8s.wait    poll until a condition (or jsonpath value) is met; the wait
+#               budget is the activity's retry_policy.timeout_sec
+#   k8s.get     one object; not_found_ok: true returns found: false instead of failing
+#   k8s.scale   set replicas on a Deployment / StatefulSet / ReplicaSet
+#   k8s.logs    tail logs by pod_name or by label_selector (up to max_pods)
+#   k8s.exec    run a command in a pod's container
+#   k8s.delete  by name (or label_selector with allow_bulk_delete: true)
+#
+# Every call takes the same `connection` block: api_server plus credentials by
+# SECRET NAME (token_secret_key, or client cert/key secret keys), and the CA as
+# ca_cert (inline PEM, public) or ca_cert_secret_key. System namespaces
+# (kube-system, ...) are refused unless allow_system_namespaces: true.
+#
+# NEEDS: a reachable cluster and a service-account token with rights to manage
+# Deployments and read/exec Pods in `namespace`, stored as secrets:
+#   moco secret upload K8S_TOKEN "$(kubectl create token <sa> -n <ns>)"
+#   moco secret upload K8S_CA "$(kubectl config view --raw --minify \
+#       -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d)"
+# The worker must be able to reach api_server. For a Job-shaped example see
+# ../../../moco-examples/k8s-demo.
+#
+#   moco run k8s.yaml -i '{"api_server": "https://127.0.0.1:6443", "namespace": "moco-demo"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-k8s
+  tags: [act-demo, k8s, requires-k8s-cluster]
+
+input:
+  api_server: https://127.0.0.1:6443
+  token_secret_key: K8S_TOKEN
+  ca_cert_secret_key: K8S_CA
+  insecure_skip_tls_verify: false
+  namespace: default
+  image: busybox:1.36
+  cleanup: true
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: prepare
+      set:
+        - conn:
+            api_server: '{{ api_server }}'
+            token_secret_key: '{{ token_secret_key }}'
+            ca_cert_secret_key: '{{ ca_cert_secret_key }}'
+            insecure_skip_tls_verify: '{{ insecure_skip_tls_verify }}'
+            namespace: '{{ namespace }}'
+        # unique per run, so re-runs never collide
+        - app#: 'act-k8s-{{ (__sys_info__.get("workflow_id") or __sys_info__.get("trace_id"))[-8:] }}'
+        - deployment:
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: '{{ app }}'
+              labels: {app: '{{ app }}', created-by: act-k8s}
+            spec:
+              replicas: 1
+              selector:
+                matchLabels: {app: '{{ app }}'}
+              template:
+                metadata:
+                  labels: {app: '{{ app }}', created-by: act-k8s}
+                spec:
+                  containers:
+                    - name: main
+                      image: '{{ image }}'
+                      command: [sh, -c, 'echo "hello from {{ app }}"; while true; do sleep 3600; done']
+
+    - task_name: list-deployments
+      activity:
+        type: k8s.list
+        input:
+          connection: '{{ conn }}'
+          api_version: apps/v1
+          kind: Deployment
+          limit: 20
+      output:
+        set:
+          - existing_deployments#: '{{ [i["metadata"]["name"] for i in _["items"]] }}'
+
+    - task_name: apply
+      activity:
+        type: k8s.apply
+        input:
+          connection: '{{ conn }}'
+          manifest: '{{ deployment }}'
+          field_manager: act-k8s
+        options:
+          retry_policy:
+            max_attempts: 1
+      output:
+        set:
+          - applied#: '{{ _["resources"] }}'
+
+    - task_name: wait-available
+      activity:
+        type: k8s.wait
+        input:
+          connection: '{{ conn }}'
+          api_version: apps/v1
+          kind: Deployment
+          name: '{{ app }}'
+          condition: Available
+          fail_on_conditions: [ReplicaFailure]
+        options:
+          retry_policy:
+            timeout_sec: 180
+      output:
+        set:
+          - available#: '{{ _["met"] }}'
+
+    - task_name: get
+      activity:
+        type: k8s.get
+        input:
+          connection: '{{ conn }}'
+          api_version: apps/v1
+          kind: Deployment
+          name: '{{ app }}'
+      output:
+        set:
+          - ready_replicas: '{{ _["resource"]["status"].get("readyReplicas") }}'
+
+    - task_name: scale-to-2
+      activity:
+        type: k8s.scale
+        input:
+          connection: '{{ conn }}'
+          kind: Deployment
+          name: '{{ app }}'
+          replicas: 2
+      output:
+        set:
+          - scaled#: '{{ _["previous_replicas"] }} -> {{ _["replicas"] }}'
+
+    - task_name: wait-two-ready
+      activity:
+        type: k8s.wait
+        input:
+          connection: '{{ conn }}'
+          api_version: apps/v1
+          kind: Deployment
+          name: '{{ app }}'
+          jsonpath: '{.status.readyReplicas}'
+          value: '2'
+        options:
+          retry_policy:
+            timeout_sec: 180
+
+    - task_name: list-pods
+      activity:
+        type: k8s.list
+        input:
+          connection: '{{ conn }}'
+          kind: Pod
+          label_selector: 'app={{ app }}'
+      output:
+        set:
+          - pod_names#: '{{ [i["metadata"]["name"] for i in _["items"]] }}'
+
+    - task_name: logs
+      activity:
+        type: k8s.logs
+        input:
+          connection: '{{ conn }}'
+          label_selector: 'app={{ app }}'
+          max_pods: 2
+          tail_lines: 20
+      output:
+        set:
+          - logs#: '{{ {p["pod_name"]: p["log"].strip() for p in _["pods"]} }}'
+
+    - task_name: exec
+      activity:
+        type: k8s.exec
+        input:
+          connection: '{{ conn }}'
+          pod_name: '{{ pod_names[0] }}'
+          container: main
+          command: [sh, -c, 'hostname; date -u']
+          timeout_sec: 30
+      output:
+        set:
+          - exec_output#: '{{ _["stdout"].strip().splitlines() }}'
+          - exec_exit_code: '{{ _["exit_code"] }}'
+
+    # --- clean up: delete the Deployment this run created ----------------------
+    - task_name: delete
+      skip_if: '{{ not cleanup }}'
+      activity:
+        type: k8s.delete
+        input:
+          connection: '{{ conn }}'
+          api_version: apps/v1
+          kind: Deployment
+          name: '{{ app }}'
+          propagation_policy: Foreground
+        options:
+          retry_policy:
+            max_attempts: 1
+      output:
+        set:
+          - deleted#: '{{ _["deleted"] }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            deployment: '{{ app }}'
+            namespace: '{{ namespace }}'
+            existing_deployments: '{{ existing_deployments }}'
+            available: '{{ available }}'
+            ready_replicas_before_scale: '{{ ready_replicas }}'
+            scaled: '{{ scaled }}'
+            pods: '{{ pod_names }}'
+            logs: '{{ logs }}'
+            exec_output: '{{ exec_output }}'
+            deleted: '{{ deleted if cleanup else False }}'

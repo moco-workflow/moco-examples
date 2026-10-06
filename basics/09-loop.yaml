@@ -1,0 +1,111 @@
+# The `loop` control-flow task.
+#
+#   in            the iterable, evaluated once (list, range(), dict.items() ...)
+#   foreach       the name of the loop variable (default `item`)
+#   index         optional name for the 0-based position
+#   execute_mode  sequential (default): one iteration at a time, in order
+#                 parallel: all iterations concurrently
+#   join_type     parallel only. all (default): every iteration must succeed, and
+#                 the result is the full list. any: the first success wins.
+#   do            the task each iteration runs, in a fresh container scope that
+#                 holds the loop variables
+#
+# The loop's result (`_`) is the list of iteration results, in input order. An
+# iteration's result is its `do` task's result, so put an `output` on `do` to
+# choose what each item contributes.
+#
+# Nested loops use different names, and the outer variable stays visible inside.
+# (Leaving a loop early: see 11-raise.)
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-loop
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  orders:
+    - {id: A, units: 2, price: 10.0}
+    - {id: B, units: 1, price: 40.0}
+    - {id: C, units: 5, price: 3.0}
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- sequential: order is guaranteed -------------------------------------
+    - task_name: price-each-order
+      loop:
+        in: '{{ orders }}'
+        foreach: order
+        index: i
+        do:
+          task_name: price-one
+          set:
+            - _amount: '{{ round(order["units"] * order["price"], 2) }}'
+          # what this item contributes to the collected list
+          output:
+            data:
+              line: '{{ i + 1 }}'
+              id: '{{ order["id"] }}'
+              amount: '{{ _amount }}'
+      output:
+        as: priced_lines
+
+    - task_name: log-priced
+      set:
+        - priced_lines#: '{{ priced_lines }}'
+
+    # --- parallel + join_type: all -> every iteration completes --------------
+    # The delays are deliberately uneven; the loop still waits for all three,
+    # and the results keep the input order.
+    - task_name: check-each-order
+      loop:
+        in: '{{ orders }}'
+        foreach: order
+        execute_mode: parallel
+        join_type: all
+        do:
+          tasks:
+            - task_name: simulate-lookup
+              activity:
+                type: builtin.delay
+                input:
+                  duration: '{{ order["units"] }}s'
+            - task_name: verdict
+              set:
+                - verdict@: '{{ order["id"] }}:ok'
+          output:
+            data: '{{ verdict }}'
+      output:
+        as: checks
+
+    - task_name: log-checks
+      set:
+        - checks#: '{{ checks }}'
+
+    # --- nested loops: each level names its own variable ---------------------
+    - task_name: outer-loop
+      loop:
+        in: '{{ ["x", "y"] }}'
+        foreach: letter
+        do:
+          task_name: inner-loop
+          loop:
+            in: '{{ [1, 2] }}'
+            foreach: number
+            do:
+              set:
+                # the outer `letter` is still visible in the inner loop
+                - _pair: '{{ letter }}{{ number }}'
+              output:
+                data: '{{ _pair }}'
+      output:
+        as: grid                    # [["x1", "x2"], ["y1", "y2"]]
+
+    - task_name: build-report
+      set:
+        - report:
+            priced_lines: '{{ priced_lines }}'
+            order_total: '{{ round(sum(l["amount"] for l in priced_lines), 2) }}'
+            checks: '{{ checks }}'
+            grid: '{{ grid }}'

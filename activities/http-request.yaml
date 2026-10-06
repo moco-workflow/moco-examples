@@ -1,0 +1,139 @@
+# `http.request`: one activity, every common request shape.
+#
+#   GET + output_json         parse the body into `json` (otherwise `text`)
+#   POST json_data            JSON body
+#   POST data                 form-encoded body
+#   headers                   arbitrary request headers
+#   encrypted_auth_token      decrypted on the worker and sent as
+#                             "Authorization: Bearer ..." -- the token never
+#                             appears in plain text in workflow variables
+#   raise_for_status: false   a 404 comes back as data (status_code,
+#                             is_success) instead of failing the activity
+#
+# Output is always {status_code, is_success, headers, json | text}.
+#
+# PROXY: when `proxy` is empty the worker falls back to MOCO_HTTP_PROXY
+# (minus MOCO_HTTP_PROXY_BYPASS). The Temporal worker usually has it set; the
+# in-memory runtime runs inside moco-server, which may not -- pass
+# -i '{"proxy": "http://proxy:port"}' if --in-memory cannot reach the internet.
+# Behind a TLS-inspecting proxy you may also need "skip_cert_verify": true.
+#
+# NEEDS: outbound HTTPS to base_url (default https://httpbin.org).
+#
+#   moco run http-request.yaml
+#   moco run http-request.yaml -i '{"base_url": "https://postman-echo.com"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-http-request
+  tags: [act-demo, http, requires-network]
+
+input:
+  base_url: https://httpbin.org
+  proxy:
+  skip_cert_verify: false
+  # a throwaway value, NOT a real credential -- httpbin echoes it back
+  demo_bearer_token: act-demo-token
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- GET, parse JSON ------------------------------------------------------
+    - task_name: get-json
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/get?source=act-http-request'
+          headers:
+            Accept: application/json
+            X-Act-Demo: 'true'
+          output_json: true
+          raise_for_status: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+        options:
+          retry_policy:
+            timeout_sec: 30
+            max_attempts: 2
+      output:
+        set:
+          - get_args#: '{{ _["json"]["args"] }}'
+
+    # --- POST a JSON body -----------------------------------------------------
+    - task_name: post-json
+      activity:
+        type: http.request
+        input:
+          method: POST
+          url: '{{ base_url }}/post'
+          json_data:
+            order_id: ORD-1
+            items: [{sku: A, qty: 2}]
+          output_json: true
+          raise_for_status: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - echoed_json#: '{{ _["json"]["json"] }}'
+
+    # --- POST a form ------------------------------------------------------------
+    - task_name: post-form
+      activity:
+        type: http.request
+        input:
+          method: POST
+          url: '{{ base_url }}/post'
+          data:
+            name: moco
+            kind: form
+          output_json: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - echoed_form#: '{{ _["json"]["form"] }}'
+
+    # --- bearer auth from an encrypted token -----------------------------------
+    # encrypt() produces the same {encrypted_data, encrypt_key_name} shape that
+    # builtin.secret.get returns; in real specs pass that instead.
+    - task_name: bearer-auth
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/bearer'
+          encrypted_auth_token: '{{ encrypt(demo_bearer_token, 60) }}'
+          output_json: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - bearer_authenticated#: '{{ _["json"].get("authenticated") }}'
+
+    # --- a 404 as data, not an error -------------------------------------------
+    - task_name: not-found-is-data
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/status/404'
+          raise_for_status: false
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - not_found:
+              status_code#: '{{ _["status_code"] }}'
+              is_success: '{{ _["is_success"] }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            get_args: '{{ get_args }}'
+            echoed_json: '{{ echoed_json }}'
+            echoed_form: '{{ echoed_form }}'
+            bearer_authenticated: '{{ bearer_authenticated }}'
+            not_found: '{{ not_found }}'

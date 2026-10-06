@@ -1,0 +1,120 @@
+# The child-workflow-as-data-resolver pattern.
+#
+# Instead of inlining a fetch-and-reshape block wherever data is needed, put it
+# in a child workflow that does one job: take a key, return a value. The parent
+# stays a readable pipeline and the resolver is independently testable.
+#
+# Why it is worth the ceremony:
+#   - the resolver has its own `input` contract, so it cannot silently depend
+#     on a parent variable that later gets renamed
+#   - each call is a named task, so it can be mocked in tests
+#   - swapping the source (cache -> HTTP -> database) touches one spec
+#
+# Two refinements shown below:
+#   1. resolving many keys at once by driving the resolver from a loop
+#   2. choosing the resolver at runtime, by picking its YAML (`contents_yaml`)
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-data-resolver
+  tags: [build-my-workflow, basics, level-4-composition]
+
+context:
+  # Two interchangeable resolvers, held as YAML text. `#literal` keeps their {{ }}
+  # unevaluated here; they are evaluated when the chosen one runs as a child.
+  cache_resolver#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: basics-data-resolver-fx-cache
+    output:
+      rate: 1.0
+      source: cache
+    main:
+      set: []
+  catalog_resolver#literal: |
+    header:
+      schema_version: 2.0.0
+      workflow_name: basics-data-resolver-fx-catalog
+    output:
+      rate: 1.08
+      source: catalog
+    main:
+      set: []
+
+input:
+  customer_id: CUST-1
+  sku_list: [SKU-A, SKU-B, SKU-C]
+  # 'cache' or 'catalog' -- selects which resolver is used
+  price_source: cache
+
+output: '{{ order_view }}'
+
+main:
+  tasks:
+    # --- 1. a single resolver call ----------------------------------------
+    # The parent gives it a key and gets back a value. Nothing else crosses
+    # the boundary.
+    - task_name: resolve-customer
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-data-resolver-customer
+            input:
+              customer_id:
+            output:
+              id: '{{ customer_id }}'
+              name: '{{ {"CUST-1": "Ada Lovelace", "CUST-2": "Grace Hopper"}.get(customer_id, "Unknown") }}'
+              tier: '{{ "gold" if customer_id == "CUST-1" else "standard" }}'
+            main:
+              set: []
+        input:
+          customer_id: '{{ customer_id }}'
+      output:
+        as: customer
+
+    # --- 2. the same resolver, driven across a list -----------------------
+    # The loop supplies one key per iteration; the resolver stays unaware that
+    # it is being called in a loop. The loop's result is the list of prices.
+    - task_name: resolve-each-price
+      loop:
+        in: '{{ sku_list }}'
+        foreach: sku
+        execute_mode: parallel
+        do:
+          task_name: resolve-price
+          workflow:
+            contents:
+              - header:
+                  schema_version: 2.0.0
+                  workflow_name: basics-data-resolver-price
+                input:
+                  sku:
+                output:
+                  sku: '{{ sku }}'
+                  price: '{{ {"SKU-A": 10.0, "SKU-B": 25.5, "SKU-C": 4.75}.get(sku, 0.0) }}'
+                main:
+                  set: []
+            input:
+              sku: '{{ sku }}'
+      output:
+        as: prices
+
+    # --- 3. picking the resolver at runtime --------------------------------
+    # `contents_yaml` takes YAML text, so the parent can choose an implementation
+    # per call. Both resolvers satisfy the same contract, which makes the swap
+    # safe. (`ref` can be an expression too, to pick a published spec by name.)
+    - task_name: resolve-fx
+      workflow:
+        contents_yaml: '{{ cache_resolver if price_source == "cache" else catalog_resolver }}'
+      output:
+        as: fx
+
+    - task_name: assemble-view
+      set:
+        - order_view:
+            customer: '{{ customer }}'
+            prices: '{{ prices }}'
+            fx_source: '{{ fx["source"] }}'
+            subtotal: '{{ round(sum(p["price"] for p in prices), 2) }}'
+            subtotal_converted: '{{ round(sum(p["price"] for p in prices) * fx["rate"], 2) }}'

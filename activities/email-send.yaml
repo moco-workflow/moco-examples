@@ -1,0 +1,85 @@
+# `email.send`: send a message over SMTP.
+#
+#   from_address, to_addresses, subject          required
+#   body_text and/or body_html                   multipart/alternative if both
+#   cc_addresses, bcc_addresses, reply_to, custom_headers
+#   attachments   [{filename, content_type, data}] -- data is BASE64, since the
+#                 worker has no shared file system with the caller
+#   smtp_host / smtp_port / username / use_tls / use_ssl / timeout
+#                 fall back to MOCO_SMTP_HOST / _PORT / _USERNAME on the worker
+#   password_secret_key   name of a secret holding the SMTP password (falls
+#                 back to MOCO_SMTP_PASSWORD); never pass the password inline
+#
+# SAFE BY DEFAULT: dry_run: true skips the send step entirely, so the spec runs
+# anywhere and cannot email anyone. The recipient defaults to a placeholder at
+# example.com (a reserved domain; never delivered).
+#
+# NEEDS (only with dry_run: false): an SMTP server, via smtp_host or the
+# worker's MOCO_SMTP_* env, plus a real recipient. For a local catch-all try
+# MailHog / Mailpit on port 1025 with use_tls: false:
+#
+#   moco run email-send.yaml
+#   moco run email-send.yaml -i '{"dry_run": false, "smtp_host": "localhost",
+#     "smtp_port": 1025, "use_tls": false, "to": ["you@your-company.com"]}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-email-send
+  tags: [act-demo, email, requires-smtp]
+
+input:
+  dry_run: true
+  from_address: moco-demo@example.com
+  to: [recipient@example.com]
+  smtp_host:
+  smtp_port:
+  use_tls: true
+  password_secret_key:
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: build-content
+      set:
+        - csv_report: "sku,qty\napple,3\npear,7\n"
+        - subject#: 'act-email-send demo {{ now().strftime("%Y-%m-%d %H:%M") }}'
+
+    - task_name: send
+      skip_if: '{{ bool(dry_run) }}'
+      activity:
+        type: email.send
+        input:
+          smtp_host: '{{ smtp_host }}'
+          smtp_port: '{{ smtp_port }}'
+          use_tls: '{{ use_tls }}'
+          password_secret_key: '{{ password_secret_key }}'
+          timeout: 15
+          from_address: '{{ from_address }}'
+          to_addresses: '{{ to }}'
+          reply_to: '{{ from_address }}'
+          subject: '{{ subject }}'
+          body_text: |
+            Hello,
+
+            This is a test message from the act-email-send Moco example.
+            The attached CSV was generated inside the workflow.
+          body_html: >-
+            <p>Hello,</p><p>This is a test message from the <b>act-email-send</b> Moco example.</p>
+          custom_headers:
+            X-Moco-Demo: act-email-send
+          attachments:
+            - filename: report.csv
+              content_type: text/csv
+              data: '{{ base64.b64encode(csv_report.encode()).decode() }}'
+      output:
+        as: send_result
+
+    - task_name: build-report
+      set:
+        - report:
+            dry_run: '{{ dry_run }}'
+            to: '{{ to }}'
+            subject: '{{ subject }}'
+            attachment_bytes: '{{ len(csv_report) }}'
+            send_result#: '{{ send_result if not dry_run else "skipped (dry_run)" }}'

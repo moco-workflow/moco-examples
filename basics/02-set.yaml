@@ -1,0 +1,23 @@
+# `set`: assign variables without calling anything.
+#
+# A `set` is an ordered list of single-key entries. Each entry can read every
+# earlier one, so one task can build a value step by step.
+#
+# The variable name decides where the value is stored:
+#   name     the workflow context. Visible to every later task and to `output`.
+#   _name    task-local. Visible to the rest of this task only, then discarded.
+#
+# `__user_info__` (who started the run) and `now()` are always available.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-set
+  tags: [build-my-workflow, basics, level-1-basics]
+
+output: '{{ greeting }}'
+
+main:
+  set:
+    - _user_id: '{{ __user_info__.get("user_id") }}'   # local: only needed for the greeting
+    - current_time: '{{ now() }}'
+    - greeting#: Hello {{ _user_id }}, the current time is {{ current_time }}

@@ -1,0 +1,152 @@
+# Every `builtin.state.*` activity, against a scratch namespace.
+#
+#   set_state          write a value at (namespace, key), optionally tagged with a topic
+#   get_state          read it back; None when absent
+#   get_state_with_ts  read value plus its last-update timestamp
+#   list_states        list entries; filter by key_pattern / topic_pattern, order, page
+#   list_namespaces    list your namespaces, filter by name_pattern
+#   update_topic       re-tag an existing key with a different topic
+#   del_state          delete one key
+#   delete_by_topic    delete every key whose topic matches a pattern
+#   delete_namespace   drop the whole namespace
+#
+# Namespaces are per-user unless in_global_ns: true (not used here). The spec
+# works only in its own scratch namespace and deletes it at the end, so it is
+# idempotent and cannot touch anyone else's state.
+#
+# NEEDS: the server's state store (Postgres). Runs on both runtimes.
+#
+#   moco run builtin-state.yaml
+#   moco run builtin-state.yaml -i '{"keep_namespace": true}'   # then inspect:
+#   moco state list --namespace act-builtin-state
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-state
+  tags: [act-demo, builtin, requires-state-store]
+
+input:
+  namespace: act-builtin-state
+  keep_namespace: false
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    # --- write three keys, two tagged with topic "orders" ------------------
+    - task_name: set-order-1
+      activity:
+        type: builtin.state.set_state
+        input:
+          namespace: '{{ namespace }}'
+          key: order-1
+          value: {status: new, amount: 10}
+          topic: orders
+    - task_name: set-order-2
+      activity:
+        type: builtin.state.set_state
+        input:
+          namespace: '{{ namespace }}'
+          key: order-2
+          value: {status: new, amount: 25}
+          topic: orders
+    - task_name: set-cursor
+      activity:
+        type: builtin.state.set_state
+        input:
+          namespace: '{{ namespace }}'
+          key: cursor
+          value: '2026-01-01T00:00:00Z'
+
+    # --- read ----------------------------------------------------------------
+    - task_name: get-order-1
+      activity:
+        type: builtin.state.get_state
+        input:
+          namespace: '{{ namespace }}'
+          key: order-1
+      output:
+        as: order_1
+    - task_name: get-cursor-with-ts
+      activity:
+        type: builtin.state.get_state_with_ts
+        input:
+          namespace: '{{ namespace }}'
+          key: cursor
+      output:
+        as: cursor_with_ts
+    - task_name: get-missing
+      activity:
+        type: builtin.state.get_state
+        input:
+          namespace: '{{ namespace }}'
+          key: no-such-key
+      output:
+        as: missing_value
+
+    # --- list ----------------------------------------------------------------
+    - task_name: list-orders-by-topic
+      activity:
+        type: builtin.state.list_states
+        input:
+          namespace: '{{ namespace }}'
+          topic_pattern: 'order*'  # '*' wildcard
+          order_by: key
+          order_direction: desc
+      output:
+        as: orders_listed
+    - task_name: list-namespaces
+      activity:
+        type: builtin.state.list_namespaces
+        input:
+          name_pattern: 'act-*'  # '*' wildcard, not SQL %
+          limit: 20
+      output:
+        as: namespaces
+
+    # --- re-tag, then delete by key and by topic -----------------------------
+    - task_name: move-order-2-to-archive
+      activity:
+        type: builtin.state.update_topic
+        input:
+          namespace: '{{ namespace }}'
+          key: order-2
+          topic: archive
+    - task_name: delete-cursor
+      activity:
+        type: builtin.state.del_state
+        input:
+          namespace: '{{ namespace }}'
+          key: cursor
+    - task_name: delete-orders-topic
+      activity:
+        type: builtin.state.delete_by_topic
+        input:
+          namespace: '{{ namespace }}'
+          topic_pattern: 'order*'  # '*' wildcard
+    - task_name: list-after-deletes
+      activity:
+        type: builtin.state.list_states
+        input:
+          namespace: '{{ namespace }}'
+      output:
+        as: remaining
+
+    # --- clean up -------------------------------------------------------------
+    - task_name: drop-namespace
+      skip_if: '{{ bool(keep_namespace) }}'
+      activity:
+        type: builtin.state.delete_namespace
+        input:
+          namespace: '{{ namespace }}'
+
+    - task_name: build-report
+      set:
+        - report:
+            order_1#: '{{ order_1 }}'
+            cursor_with_ts#: '{{ cursor_with_ts }}'
+            missing_is_none: '{{ missing_value is None }}'
+            orders_listed#: '{{ orders_listed }}'
+            namespaces#: '{{ namespaces }}'
+            # only order-2 (now topic=archive) should survive
+            remaining#: '{{ remaining }}'

@@ -1,0 +1,57 @@
+# The two zero-dependency builtins: `builtin.now` and `builtin.delay`.
+#
+#   builtin.now    no input; returns the current time. Use it instead of the
+#                  now() expression helper when the timestamp must be recorded
+#                  in history (Temporal replays reuse the recorded value).
+#   builtin.delay  sleeps for `duration`: a number of seconds, or a string such
+#                  as "500ms", "2s", "1m". On Temporal this is a durable timer.
+#
+# NEEDS: nothing. Runs on both runtimes.
+#
+#   moco run builtin-basics.yaml
+#   moco run builtin-basics.yaml -i '{"pause": "3s"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-basics
+  tags: [act-demo, builtin]
+
+input:
+  pause: 1s
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: started
+      activity:
+        type: builtin.now
+      output:
+        as: started_at
+
+    # duration as a string
+    - task_name: pause-string
+      activity:
+        type: builtin.delay
+        input:
+          duration: '{{ pause }}'
+
+    # duration as a number of seconds
+    - task_name: pause-number
+      activity:
+        type: builtin.delay
+        input:
+          duration: 0.5
+
+    - task_name: finished
+      activity:
+        type: builtin.now
+      output:
+        as: finished_at
+
+    - task_name: build-report
+      set:
+        - report:
+            started_at#: '{{ started_at }}'
+            finished_at#: '{{ finished_at }}'
+            pause: '{{ pause }}'

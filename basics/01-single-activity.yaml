@@ -1,0 +1,28 @@
+# The smallest useful workflow: a `header`, one task in `main`, and an `output`.
+#
+# Every node under `main` is a task. A task carries exactly one kind key (here
+# `activity`) plus optional shared keys: task_name, skip_if, props, output, on_error.
+#
+# A task's `output` post-processes what its kind returned:
+#   _      the kind's raw result. For builtin.delay it is not needed, so the result
+#          below is built from scratch.
+#   data   the task's result (defaults to `_`)
+#   as     the variable that stores the result
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-single-activity
+  tags: [build-my-workflow, basics, level-1-basics]
+
+# The workflow's result: an expression (as here) or a mapping, evaluated after `main`.
+output: '{{ greeting }}'
+
+main:
+  task_name: wait-and-greet
+  activity:
+    type: builtin.delay
+    input:
+      duration: 1s
+  output:
+    data: 'hello, the current time is {{ now() }}'
+    as: greeting

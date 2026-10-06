@@ -1,0 +1,73 @@
+# Demonstrates checkpoint_policy with event_count.
+#
+# The `wait` state declares how often it wants to checkpoint, and that is the whole feature.
+# The runtime fires the continue-as-new once the state has handled 3 events, and resumes the
+# machine back in `wait` afterwards — no sentinel variable, no synthetic continue_as_new event,
+# no dedicated checkpoint state, no extra transition edge, no reset transform.
+#
+# Requires the wfspec body to be a single state_machine, which is what lets the runtime record
+# "resume in state X" and mean it.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-continue-as-new
+  tags: [build-my-workflow, state-machine, requires-temporal]
+context:
+  wait_count: 0
+  max_wait_count: 8
+output: '{{ final_state }}'
+main:
+  state_machine:
+    initial_state: init
+    states:
+      - name: init
+        on_enter:
+          tasks:
+            - set:
+                - _log#: "enter init state"
+      - name: wait
+        # No max_timeout_attempts: retry counts reset when the state is re-armed on resume, so
+        # the exit condition below keys off wait_count, which survives the restart instead.
+        timeout_sec: 5
+        # Checkpoint after this state has handled 3 events. Each timer tick below is an
+        # internal transition, so it leaves the machine in `wait` and counts.
+        checkpoint_policy:
+          event_count: 3
+          enforce: true  # only for the demo; in production let Temporal decide
+        on_enter:
+          tasks:
+            - set:
+                # Reads as "(resumed)" on the run after the checkpoint. on_enter does not
+                # re-run on resume, so this only prints on a genuine entry.
+                - _log#: "enter wait state ({{wait_count}})"
+      - name: exit
+        is_terminal: true
+        on_enter:
+          tasks:
+            - set:
+                - _log#: "enter exit state"
+
+    transitions:
+      - from_state: init
+        to_state: wait
+        trigger:
+      # Each tick is an internal transition: the machine stays in `wait`, so it counts toward
+      # the checkpoint_policy event_count above.
+      - from_state: wait
+        to_state:
+        trigger:
+          event_type: sys.timer
+          condition: '{{wait_count < max_wait_count}}'
+          action:
+            tasks:
+              - set:
+                  - wait_count: '{{wait_count + 1}}'
+                  - _log#: "wait timer triggered ({{wait_count}})"
+                  - _log_resumed#: "resumed_from={{ __sys_info__.get('state_machine', {}).get('resumed_from_state') }}"
+      - from_state: wait
+        to_state: exit
+        trigger:
+          event_type: sys.timer
+          condition: '{{wait_count >= max_wait_count}}'
+  output:
+    as: final_state
