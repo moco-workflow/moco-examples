@@ -1,0 +1,29 @@
+# `tasks`: a container that runs its child tasks.
+#
+# Children run in order by default (`props.execute_mode: sequential`; see
+# 10-parallel for the other mode). A value a child writes to the context is visible
+# to every later child, which is how data is carried from one step to the next.
+#
+# `task_name` is optional. Name the tasks you want to see in logs and traces, or
+# to mock in tests.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-multi-step-tasks
+  tags: [build-my-workflow, basics, level-1-basics]
+
+output: '{{ greeting }}'
+
+main:
+  tasks:
+    - set:
+        - start_time: '{{ now() }}'
+
+    - task_name: delay-step
+      activity:
+        type: builtin.delay
+        input:
+          duration: 1s
+
+    - set:
+        - greeting: Hello, your request was received at {{ start_time }}. Current time is {{ now() }}

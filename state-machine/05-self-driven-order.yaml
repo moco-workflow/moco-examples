@@ -1,0 +1,160 @@
+# A machine that drives itself: each state's on_enter does the work, then
+# reports the outcome as an event that picks the next transition.
+#
+#   validating --validated--------------------------> charging
+#              --validation_failed------------------> failed
+#   charging   --payment_result (data.success)------> completed
+#              --payment_result (not data.success)--> failed
+#
+# What it teaches:
+#   - the "work in on_enter, emit the outcome" pattern: emit_event with no
+#     target_workflow_id sends to this workflow, on the machine's
+#     event_source_topic
+#   - one event_type, two transitions told apart by `trigger.condition` on the
+#     payload: event_type matches the event's own type, never something inside
+#     `data`, so key off the payload with a condition
+#   - copying data out of the event in `trigger.action`
+#   - the machine's result: the terminal state's name, stored with output.as
+#
+# Self-emitting from on_enter is safe: the machine subscribes to its topic
+# before it enters the initial state, and handles one event at a time, so an
+# event emitted during on_enter waits in the queue until on_enter returns.
+# (Prefer an automatic transition with a condition when the outcome is already
+# in a variable -- see 01. An event is the right tool when the outcome arrives
+# as data, as here.)
+#
+# NEEDS: outbound HTTPS to httpbin.org. Behind a TLS-inspecting proxy add
+# "skip_cert_verify": true to the input.
+#
+#   moco run 05-self-driven-order.yaml
+#   moco run 05-self-driven-order.yaml -i '{"payment_status": 402}'   card declined -> failed
+#   moco run 05-self-driven-order.yaml -i '{"order": {"id": "ORD-9", "amount": 0}}'   invalid -> failed
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-self-driven-order
+  tags: [build-my-workflow, state-machine, requires-network]
+
+context:
+  status: new
+  reason:
+  receipt:
+
+input:
+  order:
+    id: ORD-1
+    amount: 120
+  payment_status: 200          # what the "payment gateway" (httpbin /status) answers
+  base_url: https://httpbin.org
+  proxy:
+  skip_cert_verify: false
+
+output:
+  order_id: '{{ order["id"] }}'
+  final_state: '{{ final_state }}'
+  status: '{{ status }}'
+  reason: '{{ reason }}'
+  receipt: '{{ receipt }}'
+
+main:
+  task_name: order-processor
+  state_machine:
+    initial_state: validating
+    event_source_topic: order_events
+    timeout_sec: 120             # a safety net: fail rather than hang if an event is lost
+
+    states:
+      - name: validating
+        on_enter:
+          tasks:
+            - task_name: validate-order
+              activity:
+                type: http.request
+                input:
+                  method: POST
+                  url: '{{ base_url }}/post'
+                  json_data: '{{ order }}'
+                  output_json: true
+                  raise_for_status: true
+                  proxy: '{{ proxy }}'
+                  skip_cert_verify: '{{ skip_cert_verify }}'
+              output:
+                # httpbin echoes the order; a real service would check it
+                data: '{{ _["json"]["json"]["amount"] > 0 }}'
+                as: valid@          # container scope: the next task in on_enter reads it
+            - task_name: report-validation
+              emit_event:
+                topic: order_events
+                event_type: '{{ "validated" if valid else "validation_failed" }}'
+                data:
+                  reason: '{{ None if valid else "amount must be positive" }}'
+
+      - name: charging
+        on_enter:
+          tasks:
+            - task_name: charge-card
+              activity:
+                type: http.request
+                input:
+                  method: GET
+                  url: '{{ base_url }}/status/{{ payment_status }}'
+                  raise_for_status: false     # a decline is data, not an error
+                  proxy: '{{ proxy }}'
+                  skip_cert_verify: '{{ skip_cert_verify }}'
+              output:
+                as: payment@
+            - task_name: report-payment
+              emit_event:
+                topic: order_events
+                event_type: payment_result
+                data:
+                  success: '{{ payment["is_success"] }}'
+                  http_status: '{{ payment["status_code"] }}'
+
+      - name: completed
+        is_terminal: true
+        on_enter:
+          set:
+            - status#: completed
+
+      - name: failed
+        is_terminal: true
+        on_enter:
+          set:
+            - status#: failed
+
+    transitions:
+      - from_state: validating
+        to_state: charging
+        trigger:
+          event_type: validated
+
+      - from_state: validating
+        to_state: failed
+        trigger:
+          event_type: validation_failed
+          action:
+            set:
+              - reason: '{{ event["data"]["reason"] }}'
+
+      # Same event_type, told apart by the payload.
+      - from_state: charging
+        to_state: completed
+        trigger:
+          event_type: payment_result
+          condition: '{{ event["data"]["success"] }}'
+          action:
+            set:
+              - receipt: 'paid {{ order["amount"] }} for {{ order["id"] }}'
+
+      - from_state: charging
+        to_state: failed
+        trigger:
+          event_type: payment_result
+          condition:
+            not: '{{ event["data"]["success"] }}'
+          action:
+            set:
+              - reason: 'payment declined (HTTP {{ event["data"]["http_status"] }})'
+  output:
+    as: final_state

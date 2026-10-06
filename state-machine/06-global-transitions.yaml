@@ -1,0 +1,196 @@
+# Global (wildcard) transitions, `from_state` lists, and which transition wins.
+#
+#   placed --next--> paid --next--> packing --next--> shipped --next--> delivered
+#
+#   cancel           (no from_state)       from ANY state --> cancelled
+#   cancel           from shipped          --> return_requested   (wins over the wildcard)
+#   change_address   from [placed, paid, packing]   internal: record it, stay
+#   change_address   from shipped          internal: too late, note it
+#
+# What it teaches:
+#   - a transition with no `from_state` is a wildcard: it fires from any state.
+#     Use it for cancellation or error escalation instead of one edge per state
+#   - state-specific transitions are matched first; the wildcard is the fallback.
+#     So `shipped` can handle `cancel` its own way
+#   - `from_state` also takes a list, scoping one transition to several states
+#   - events are handled one at a time, in the order they were emitted
+#
+# The customer's actions are scripted by the `script` input: for each state, the
+# events to send on entering it. Each on_enter emits its state's events to this
+# workflow; a real system would receive them from a UI or another workflow
+# (see 04-human-in-the-loop).
+#
+#   moco run 06-global-transitions.yaml                                        delivered
+#   moco run 06-global-transitions.yaml -i '{"script": {"placed": ["next"], "paid": ["cancel"]}}'
+#       -> cancelled by the wildcard
+#   moco run 06-global-transitions.yaml -i '{"script": {"placed": ["next"], "paid": ["next"], "packing": ["next"], "shipped": ["change_address", "cancel"]}}'
+#       -> return_requested: shipped handles cancel itself
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-global-transitions
+  tags: [build-my-workflow, state-machine]
+
+context:
+  journey: []
+  address_changes: []
+
+input:
+  # state -> events the customer sends on entering it
+  script:
+    placed: [next, change_address]
+    paid: [next]
+    packing: [change_address, next]
+    shipped: [next]
+
+output:
+  final_state: '{{ final_state }}'
+  journey: '{{ journey }}'
+  address_changes: '{{ address_changes }}'
+
+functions:
+  # Sends the scripted events for one state, in order. A function runs in a fresh
+  # context made of its input only, so the target id is passed in.
+  send-scripted-events:
+    input:
+      target:
+      state:
+      events: []
+    main:
+      task_name: send-each
+      loop:
+        in: '{{ events }}'
+        foreach: event_type
+        do:
+          task_name: send-one
+          emit_event:
+            topic: orders
+            event_type: '{{ event_type }}'
+            target_workflow_id: '{{ target }}'
+            data:
+              from_state: '{{ state }}'
+
+main:
+  task_name: order-journey
+  state_machine:
+    initial_state: placed
+    event_source_topic: orders
+    timeout_sec: 60
+
+    states:
+      - name: placed
+        on_enter:
+          task_name: enter-placed
+          workflow:
+            function: send-scripted-events
+            input:
+              target: '{{ __sys_info__.get("workflow_id") }}'
+              state: placed
+              events: '{{ script.get("placed", []) }}'
+          output:
+            set:
+              - _t: '{{ journey.append("placed") }}'
+      - name: paid
+        on_enter:
+          task_name: enter-paid
+          workflow:
+            function: send-scripted-events
+            input:
+              target: '{{ __sys_info__.get("workflow_id") }}'
+              state: paid
+              events: '{{ script.get("paid", []) }}'
+          output:
+            set:
+              - _t: '{{ journey.append("paid") }}'
+      - name: packing
+        on_enter:
+          task_name: enter-packing
+          workflow:
+            function: send-scripted-events
+            input:
+              target: '{{ __sys_info__.get("workflow_id") }}'
+              state: packing
+              events: '{{ script.get("packing", []) }}'
+          output:
+            set:
+              - _t: '{{ journey.append("packing") }}'
+      - name: shipped
+        on_enter:
+          task_name: enter-shipped
+          workflow:
+            function: send-scripted-events
+            input:
+              target: '{{ __sys_info__.get("workflow_id") }}'
+              state: shipped
+              events: '{{ script.get("shipped", []) }}'
+          output:
+            set:
+              - _t: '{{ journey.append("shipped") }}'
+      - name: delivered
+        is_terminal: true
+      - name: cancelled
+        is_terminal: true
+      - name: return_requested
+        is_terminal: true
+
+    transitions:
+      # --- the happy path ------------------------------------------------------
+      - from_state: placed
+        to_state: paid
+        trigger:
+          event_type: next
+      - from_state: paid
+        to_state: packing
+        trigger:
+          event_type: next
+      - from_state: packing
+        to_state: shipped
+        trigger:
+          event_type: next
+      - from_state: shipped
+        to_state: delivered
+        trigger:
+          event_type: next
+
+      # --- a from_state list ---------------------------------------------------
+      # Internal transitions (empty to_state): handle the event, stay put.
+      - from_state: [placed, paid, packing]
+        to_state:
+        trigger:
+          event_type: change_address
+          action:
+            set:
+              # The current state can differ from the sender's: events queue up
+              # until on_enter returns, so `next` may be handled first.
+              - _now: '{{ __sys_info__.get("state_machine", {}).get("current_state") }}'
+              - _c#: '{{ address_changes.append("changed in " + _now + " (sent from " + event["data"]["from_state"] + ")") }}'
+
+      - from_state: shipped
+        to_state:
+        trigger:
+          event_type: change_address
+          action:
+            set:
+              - _c#: '{{ address_changes.append("refused: already shipped") }}'
+
+      # --- state-specific beats wildcard ---------------------------------------
+      # Listed before the wildcard here, but order is not what decides it: a
+      # transition from the current state is always tried before a wildcard.
+      - from_state: shipped
+        to_state: return_requested
+        trigger:
+          event_type: cancel
+
+      # --- the wildcard: no from_state ------------------------------------------
+      - to_state: cancelled
+        trigger:
+          event_type: cancel
+          action:
+            set:
+              - _c#: '{{ journey.append("cancelled while " + event["data"]["from_state"]) }}'
+
+  # Not part of the machine: record the path, for the output.
+  output:
+    set:
+      - _t: '{{ journey.append("ended in " + _) }}'
+    as: final_state

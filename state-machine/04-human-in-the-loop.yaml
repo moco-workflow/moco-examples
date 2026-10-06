@@ -29,17 +29,18 @@
 #        moco run 04-human-in-the-loop.yaml -i '{"expense": {"id": "EXP-7", "amount": 90, "submitter": "sam", "description": "taxi"}}'
 #
 #   2. A real human: start it without the simulator, then send the decision yourself with
-#      05-send-decision.yaml, using the workflow id `moco start` prints.
+#      04-human-in-the-loop.send-decision.yaml, using the workflow id `moco start` prints.
 #
 #        moco start 04-human-in-the-loop.yaml -i '{"simulate_approver": false}'
-#        moco run 05-send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "add_comment", "comment": "receipt?"}'
-#        moco run 05-send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "approve", "comment": "ok"}'
+#        moco run 04-human-in-the-loop.send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "add_comment", "comment": "receipt?"}'
+#        moco run 04-human-in-the-loop.send-decision.yaml -i '{"workflow_id": "<id>", "event_type": "approve", "comment": "ok"}'
 #        moco status <id>
 #
 #      Nobody answers? After 3 reminders of `reminder_sec` each it expires.
 #
-# Emitting to yourself from on_enter races the machine arming its transitions, which is why
-# the simulator is an async child with a delay rather than an emit_event right here.
+# The simulator is an async child with a delay, rather than an emit_event right here, because
+# it stands in for a person who answers later. A machine CAN emit to itself from on_enter
+# (see 05-self-driven-order): the event waits in the queue until on_enter returns.
 
 header:
   schema_version: 2.0.0
@@ -136,7 +137,7 @@ main:
                     - status: awaiting_approval
                     - _t: '{{ audit.append("awaiting_approval") }}'
                     - _how_to_decide#: >-
-                        waiting for a human decision. Send one with: moco run 05-send-decision.yaml -i '{"workflow_id": "{{ self_id }}", "event_type": "approve"}'
+                        waiting for a human decision. Send one with: moco run 04-human-in-the-loop.send-decision.yaml -i '{"workflow_id": "{{ self_id }}", "event_type": "approve"}'
                 - task_name: start-simulated-approver
                   skip_if: '{{ not simulate_approver }}'
                   workflow:

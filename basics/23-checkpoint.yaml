@@ -1,0 +1,64 @@
+# `checkpoint`: continue-as-new for long-running workflows.
+#
+#   checkpoint:
+#     serialize_context: true   (default) carry the context into the new run
+#     enforce: false            (default) only when the runtime suggests it;
+#                               true: always
+#
+# On Temporal a workflow's event history grows with every task. A checkpoint
+# lets the engine start a fresh run when the history gets large: it serializes
+# the CONTEXT and restarts `main` from the top. Container scopes (`x@`) and
+# task-locals (`_x`) are not carried over. `_` = null.
+#
+# Because `main` starts again from the top, write it to resume:
+#   - keep progress in the context (plain names, not `@`);
+#   - make the loop start from that progress;
+#   - guard one-off steps with skip_if.
+#
+# In the in-memory runtime a checkpoint does nothing, and the spec simply runs
+# to the end -- written this way, both runtimes give the same answer.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-checkpoint
+  tags: [build-my-workflow, basics, level-5-events, requires-temporal]
+
+context:
+  started: false
+  processed: 0
+  total_value: 0
+
+input:
+  total: 300
+  checkpoint_every: 100
+
+output:
+  processed: '{{ processed }}'
+  total_value: '{{ total_value }}'    # 0 + 1 + ... + 299 = 44850
+
+main:
+  tasks:
+    # One-off setup: skipped in every run after the first.
+    - task_name: setup
+      skip_if: '{{ started }}'
+      set:
+        - started#: true
+
+    - task_name: process-items
+      loop:
+        # Resumes where the previous run stopped.
+        in: '{{ range(processed, total) }}'
+        foreach: n
+        do:
+          tasks:
+            - task_name: process-one
+              set:
+                - total_value: '{{ total_value + n }}'
+                - processed: '{{ n + 1 }}'
+
+            # Offer a checkpoint every `checkpoint_every` items. The runtime
+            # decides whether to act on it; `enforce: true` would always restart.
+            - task_name: maybe-continue-as-new
+              skip_if: '{{ processed % checkpoint_every != 0 }}'
+              checkpoint:
+                serialize_context: true

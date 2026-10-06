@@ -1,0 +1,152 @@
+# Timers: per-state timers that emit events, and the machine-wide timeout.
+#
+#   declared as                            emits             after max_timeout_attempts
+#   state `timeout_sec`                    sys.timer         sys.timer.final
+#   state `timers: [{name: poll, ...}]`    sys.timer.poll    sys.timer.poll.final
+#   state_machine `timeout_sec`            -- the machine fails with a timeout error
+#
+# A state's timers are armed when it is entered and cancelled when it is left.
+# A timer event is handled like any other event. When it fires and no transition
+# changes the state (none matches, its condition is false, or it is internal),
+# the timer re-arms, up to `max_timeout_attempts` times (empty or 0: forever),
+# then emits its `.final` event. If nothing handles `.final` either, the machine
+# fails with StateTimeoutRetriesExhaustedError.
+#
+# The timer event's `data` is {state_name, timer_name, timeout_sec, retry_count}.
+#
+# Three machines, one per feature, run one after the other (about 10 seconds):
+#   1. poll-job       two named timers in one state, routed differently
+#   2. wait-for-ack   the unnamed timer: nudge on each lapse, give up on .final
+#   3. hard-limit     the machine-wide timeout_sec, caught with on_error
+#
+# Try:  -i '{"ready_after": 20}'    the deadline timer wins: poll-job ends in timed_out
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-timers
+  tags: [build-my-workflow, state-machine]
+
+context:
+  polls: 0
+  nudges: []
+  hard_limit:
+
+input:
+  ready_after: 3       # polls until the "job" is ready
+  deadline_sec: 8
+
+output:
+  poll_job: '{{ poll_job }}'
+  polls: '{{ polls }}'
+  wait_for_ack: '{{ wait_for_ack }}'
+  nudges: '{{ nudges }}'
+  hard_limit: '{{ hard_limit }}'
+
+main:
+  tasks:
+    # --- 1. several named timers, routed differently --------------------------
+    # `poll` fires every second and keeps the machine in `polling`; `deadline`
+    # fires once and ends it. Whichever transition matches first wins.
+    - task_name: poll-job
+      state_machine:
+        initial_state: polling
+        states:
+          - name: polling
+            timers:
+              - name: poll
+                timeout_sec: 1
+                max_timeout_attempts:       # forever: `deadline` bounds it
+              - name: deadline
+                timeout_sec: '{{ deadline_sec }}'
+          - name: ready
+            is_terminal: true
+          - name: timed_out
+            is_terminal: true
+        transitions:
+          # Internal: count the poll and stay. In a real spec the action would
+          # call the job's status endpoint.
+          - from_state: polling
+            to_state:
+            trigger:
+              event_type: sys.timer.poll
+              condition: '{{ polls + 1 < ready_after }}'
+              action:
+                set:
+                  - polls#: '{{ polls + 1 }}'
+          - from_state: polling
+            to_state: ready
+            trigger:
+              event_type: sys.timer.poll
+              condition: '{{ polls + 1 >= ready_after }}'
+              action:
+                set:
+                  - polls#: '{{ polls + 1 }}'
+          - from_state: polling
+            to_state: timed_out
+            trigger:
+              event_type: sys.timer.deadline
+      output:
+        as: poll_job#
+
+    # --- 2. the unnamed timer and its .final event ------------------------------
+    # Nobody acknowledges, so the timer lapses: each lapse is a nudge (internal
+    # transition), and once max_timeout_attempts are used up `sys.timer.final`
+    # ends the wait: with max_timeout_attempts: 3 that is three nudges
+    # (retry_count 0, 1, 2), then gave_up. Without that last transition the
+    # machine would fail with StateTimeoutRetriesExhaustedError.
+    - task_name: wait-for-ack
+      state_machine:
+        initial_state: waiting
+        event_source_topic: acks
+        states:
+          - name: waiting
+            timeout_sec: 1
+            max_timeout_attempts: 3
+          - name: acknowledged
+            is_terminal: true
+          - name: gave_up
+            is_terminal: true
+        transitions:
+          - from_state: waiting
+            to_state: acknowledged
+            trigger:
+              event_type: ack                 # never sent in this demo
+          - from_state: waiting
+            to_state:
+            trigger:
+              event_type: sys.timer
+              action:
+                set:
+                  - _n#: '{{ nudges.append("nudge, retry_count=" + str(event["data"]["retry_count"])) }}'
+          - from_state: waiting
+            to_state: gave_up
+            trigger:
+              event_type: sys.timer.final
+      output:
+        as: wait_for_ack#
+
+    # --- 3. the machine-wide timeout ---------------------------------------------
+    # `timeout_sec` on the state_machine bounds the whole machine, whatever state
+    # it is in. Reaching it is an error, not a terminal state, so handle it with
+    # on_error -- here by recording what happened.
+    - task_name: hard-limit
+      state_machine:
+        initial_state: waiting
+        event_source_topic: never_used
+        timeout_sec: 2
+        states:
+          - name: waiting
+          - name: done
+            is_terminal: true
+        transitions:
+          - from_state: waiting
+            to_state: done
+            trigger:
+              event_type: finish              # never sent in this demo
+      output:
+        as: hard_limit
+      on_error:
+        catch: true
+        do:
+          set:
+            - hard_limit#: 'machine timed out ({{ _["error_type"] }})'

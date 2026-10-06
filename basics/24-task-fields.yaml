@@ -1,0 +1,155 @@
+# The fields every task shares, whatever its kind.
+#
+#   task_name   names the task in logs, traces and tests (mock it, or unit-test it)
+#   skip_if     a condition; when true the task does not run at all
+#   props       container behaviour, e.g. execute_mode (see 10-parallel)
+#   output      post-processes the kind's raw result `_`: set / data / as
+#   on_error    catches a failure of the kind or of `output`
+#
+# They run in this order:
+#
+#   skip_if --true--> skipped: result null, `output` and `on_error` do not run
+#      |
+#    false
+#      v
+#   kind --> output -----------------------------> result
+#      \        \
+#       +--------+-- error --> on_error.do ------> result (catch: true)
+#
+# An error in `skip_if` itself is not caught by `on_error`.
+# 04-data-flow covers `output` in depth, 08-condition `skip_if`, 16-error-handling
+# `on_error`. This file shows them side by side, on real HTTP calls.
+#
+# NEEDS: outbound HTTPS to httpbin.org. Behind a TLS-inspecting proxy add
+# "skip_cert_verify": true to the input.
+#
+# Try:  -i '{"dry_run": true}'        the notification is skipped
+#       -i '{"status_code": 200}'     the upstream call succeeds, on_error stays idle
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-task-fields
+  tags: [build-my-workflow, basics, level-5-errors]
+
+context:
+  log: []
+  # A skipped task writes nothing, so a default here is what later tasks read.
+  notification: skipped (dry run)
+
+input:
+  base_url: https://httpbin.org
+  proxy:
+  skip_cert_verify: false
+  user_id: 42
+  dry_run: false
+  status_code: 503                # what the "flaky upstream" answers
+
+output:
+  profile: '{{ profile }}'
+  notification: '{{ notification }}'
+  upstream: '{{ upstream }}'
+  title: '{{ title }}'
+  log: '{{ log }}'
+
+main:
+  # --- task_name ------------------------------------------------------------
+  # Any task can be named, containers included. Names show up in the trace as
+  # [task-fields-tour] > [fetch-profile], and are what a test mocks or targets.
+  task_name: task-fields-tour
+  tasks:
+    # --- output: set, data, as ---------------------------------------------
+    # `_` is the raw http.request result. `set` writes variables (here a local
+    # and a log line), `data` builds the task's result from them, and `as`
+    # stores that result.
+    - task_name: fetch-profile
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/anything/users/{{ user_id }}'   # httpbin echoes the request
+          output_json: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - _status: '{{ _["status_code"] }}'
+          - _t: '{{ log.append("fetch-profile: HTTP " + str(_status)) }}'
+        data:
+          user_id: '{{ user_id }}'
+          url: '{{ _["json"]["url"] }}'
+          status: '{{ _status }}'
+        as: profile#
+
+    # --- skip_if -----------------------------------------------------------
+    # It reads as "skip this when...". On a dry run nothing is posted, `output`
+    # does not run, and `notification` keeps its context default.
+    - task_name: send-notification
+      skip_if: '{{ dry_run }}'
+      activity:
+        type: http.request
+        input:
+          method: POST
+          url: '{{ base_url }}/post'
+          json_data:
+            to: '{{ user_id }}'
+            message: your profile was read
+          output_json: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        set:
+          - _t: '{{ log.append("send-notification: sent") }}'
+        data: 'sent to {{ _["json"]["json"]["to"] }}'
+        as: notification#
+
+    # --- on_error: the kind fails ------------------------------------------
+    # httpbin answers /status/503 with a 503, and raise_for_status turns that
+    # into an error. catch: true consumes it: the result of `do` becomes the
+    # task's result, and the task's own `output` is skipped -- so `do` writes
+    # `upstream` itself. Inside `do`, `_` is the error:
+    # {error_type, error_message, error_detail}.
+    - task_name: call-flaky-upstream
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/status/{{ status_code }}'
+          raise_for_status: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+        options:
+          retry_policy:
+            max_attempts: 1           # fail fast for the demo (see 16-error-handling)
+      output:
+        data: {status: ok}
+        as: upstream#
+      on_error:
+        catch: true
+        do:
+          set:
+            - upstream#:
+                status: degraded
+                error_type: '{{ _["error_type"] }}'
+            - _t: '{{ log.append("call-flaky-upstream: caught " + _["error_type"]) }}'
+
+    # --- on_error: the output fails ----------------------------------------
+    # The call succeeds, but /get has no "title" key, so `output.data` raises.
+    # on_error covers `output` as well as the kind.
+    - task_name: read-title
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ base_url }}/get'
+          output_json: true
+          proxy: '{{ proxy }}'
+          skip_cert_verify: '{{ skip_cert_verify }}'
+      output:
+        data: '{{ _["json"]["title"] }}'
+        as: title
+      on_error:
+        catch: true
+        do:
+          set:
+            - title#: untitled
+            - _t: '{{ log.append("read-title: caught " + _["error_type"]) }}'

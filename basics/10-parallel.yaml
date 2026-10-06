@@ -6,6 +6,7 @@
 #                              child results in declaration order, and the
 #                              container fails if any child fails
 #     join_type: any           the first child to succeed wins; the rest are cancelled
+#                              (21-race)
 #
 # Each child runs against its own copy of the enclosing scopes, so siblings cannot
 # see each other's `@` writes. Context writes are applied as children finish.

@@ -1,0 +1,169 @@
+# Racing: `join_type: any` -- take the first success, cancel the rest.
+#
+# 10-parallel waits for every child (`join_type: all`). With `any`:
+#
+#   - every child starts at once;
+#   - the first child to finish WITHOUT an error decides the result (`_` is
+#     that child's result, not a list);
+#   - the other children are cancelled;
+#   - a failing child does not fail the race while another may still win.
+#     Only when EVERY child fails does the container fail, with the last error.
+#
+# The same applies to a parallel `loop` with `join_type: any`: its `_` is the
+# first successful iteration's result.
+#
+# Typical uses: mirrors / replicas, "first answer wins", or racing real work
+# against a deadline.
+#
+# The delays stand in for real calls. builtin.delay keeps the example
+# self-contained; swap in http.get or any other activity.
+#
+# Race only REGULAR activities on Temporal. builtin.delay, like every activity
+# whose manifest says execute_locally, runs as a Temporal local activity by
+# default. While a local activity is still running, the workflow does not
+# receive any other results: not the other children's, not a timer's. They all
+# arrive together when the slowest one finishes, and the first child IN
+# DECLARATION ORDER wins -- no race at all. `options.execute_locally: false`
+# makes it a regular activity, as below. (The in-memory runtime races either
+# way.)
+#
+# Try:  -i '{"fail_fast_mirror": false}'   the fast mirror wins instead
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-race
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  fail_fast_mirror: true
+  regions: [eu, us, ap]
+
+output: '{{ summary }}'
+
+main:
+  tasks:
+    # --- 1. a tasks container racing three mirrors ---------------------------
+    # The fast mirror fails (by default), so the medium one wins and the slow
+    # one is cancelled. Each child decides what it contributes with
+    # output.data, so the winner's result is a plain string.
+    - task_name: fetch-from-mirrors
+      props:
+        execute_mode: parallel
+        join_type: any
+      tasks:
+        - task_name: mirror-fast
+          tasks:
+            - task_name: mirror-fast-call
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 1s
+                options:
+                  execute_locally: false
+            - task_name: mirror-fast-check
+              raise:
+                if: '{{ fail_fast_mirror }}'
+                type: error
+                error_type: MirrorDown
+                message: fast mirror is down
+          output:
+            data: fast
+        - task_name: mirror-medium
+          activity:
+            type: builtin.delay
+            input:
+              duration: 2s
+            options:
+              execute_locally: false
+          output:
+            data: medium
+        - task_name: mirror-slow
+          activity:
+            type: builtin.delay
+            input:
+              duration: 5s
+            options:
+              execute_locally: false
+          output:
+            data: slow
+      output:
+        as: winner#                 # "medium" (or "fast" with fail_fast_mirror: false)
+
+    # --- 2. racing work against a deadline -----------------------------------
+    # A wait_for with no event is a timer (22-sleep). Whichever finishes first
+    # decides: real work returns its value, the timer returns the fallback.
+    - task_name: lookup-or-timeout
+      props:
+        execute_mode: parallel
+        join_type: any
+      tasks:
+        - task_name: slow-lookup
+          activity:
+            type: builtin.delay
+            input:
+              duration: 10s
+            options:
+              execute_locally: false
+          output:
+            data: {source: lookup, value: 42}
+        - task_name: deadline
+          wait_for:
+            timeout_sec: 2
+          output:
+            data: {source: deadline, value: null}
+      output:
+        as: lookup#                 # {source: deadline, value: null}
+
+    # --- 3. a parallel loop with join_type any -------------------------------
+    # Ask every region; keep the first answer.
+    - task_name: nearest-region
+      loop:
+        in: '{{ regions }}'
+        foreach: region
+        index: i
+        execute_mode: parallel
+        join_type: any
+        do:
+          task_name: ping-region
+          activity:
+            type: builtin.delay
+            input:
+              duration: '{{ 3 - i }}s'      # the last region answers first
+            options:
+              execute_locally: false
+          output:
+            data: '{{ region }}'
+      output:
+        as: nearest#                # "ap"
+
+    # --- 4. when every child fails -------------------------------------------
+    # Then the race itself fails, with the last error. Catch it like any other.
+    # A caught task skips its own `output`, so `do` stores what it needs.
+    - task_name: all-mirrors-down
+      props:
+        execute_mode: parallel
+        join_type: any
+      tasks:
+        - task_name: down-1
+          raise:
+            type: error
+            error_type: MirrorDown
+            message: mirror 1 is down
+        - task_name: down-2
+          raise:
+            type: error
+            error_type: MirrorDown
+            message: mirror 2 is down
+      on_error:
+        catch: true
+        do:
+          set:
+            - backup#: 'none available ({{ _["error_message"] }})'
+
+    - task_name: build-summary
+      set:
+        - summary:
+            winner: '{{ winner }}'
+            lookup: '{{ lookup }}'
+            nearest: '{{ nearest }}'
+            backup: '{{ backup }}'

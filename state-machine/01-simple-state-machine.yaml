@@ -20,7 +20,9 @@
 # finished in.
 #
 # Next: 02-continue-as-new (durability), 03-continue-as-new-timer (named
-# timers), and 04-human-in-the-loop (event-driven transitions).
+# timers), 04-human-in-the-loop (event-driven transitions), 05-self-driven-order
+# (emitting to yourself), 06-global-transitions (wildcards), 07-callback-order
+# and 08-timers.
 
 header:
   schema_version: 2.0.0

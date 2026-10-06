@@ -1,0 +1,180 @@
+# `switch` in depth: compare one value against a list of cases.
+#
+#   switch:
+#     value: <value>       evaluated ONCE
+#     cases:
+#       - match: <value>   a scalar matches with ==, a list matches with `in`
+#         do: <task>
+#     default: <task>      optional; runs when no case matches
+#
+# The first matching case runs; later cases are not checked. The result of a
+# switch task (`_`) is the result of the `do` (or `default`) that ran, or null
+# when nothing matched and there is no `default`.
+#
+# `match` is a value like any other, so it may be an expression -- compare
+# against an input, or build the list at runtime.
+#
+# switch only tests equality / membership. For ranges (`amount > 1000`) or
+# unrelated tests, use `branches` (19-branches).
+#
+# Try:  -i '{"order": {"kind": "partner", "amount": 50, "status": 404}}'
+#       -i '{"order": {"kind": "gift", "amount": 50, "status": 200}}'    unknown kind -> error
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-switch
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  order:
+    kind: wholesale
+    amount: 1200
+    status: 200
+  vip_kind: partner
+
+output: '{{ summary }}'
+
+main:
+  tasks:
+    # --- 1. scalar and list matches, result through output.as ----------------
+    # Each `do` returns its discount as `output.data`, and the switch stores
+    # the result with `output.as`. `default` raises: an unknown kind is a bug in
+    # the caller, not a case to paper over.
+    - task_name: discount
+      switch:
+        value: '{{ order["kind"] }}'
+        cases:
+          - match: retail
+            do:
+              set:
+                - _d: 0.0
+              output:
+                data: '{{ _d }}'
+          - match: [wholesale, partner]
+            do:
+              set:
+                - _d: '{{ 0.15 if order["amount"] > 1000 else 0.10 }}'
+              output:
+                data: '{{ _d }}'
+        default:
+          raise:
+            type: error
+            error_type: ValidationError
+            message: 'unknown order kind {{ order["kind"] }}'
+      output:
+        as: discount#
+
+    # --- 2. match is an expression -------------------------------------------
+    # The case compares against an input instead of a literal. Cases are tried
+    # in order, so this one wins over a later case that would also match.
+    - task_name: lane
+      switch:
+        value: '{{ order["kind"] }}'
+        cases:
+          - match: '{{ vip_kind }}'
+            do:
+              set:
+                - _l: priority
+              output:
+                data: '{{ _l }}'
+          - match: '{{ ["wholesale", "partner"] }}'
+            do:
+              set:
+                - _l: bulk
+              output:
+                data: '{{ _l }}'
+        default:
+          set:
+            - _l: normal
+          output:
+            data: '{{ _l }}'
+      output:
+        as: lane#
+
+    # --- 3. not only strings -------------------------------------------------
+    # `value` keeps its type: here an int is matched against ints. Writing
+    # `match: "404"` would never match, because "404" != 404.
+    - task_name: status-text
+      switch:
+        value: '{{ order["status"] }}'
+        cases:
+          - match: 200
+            do:
+              set:
+                - _s: ok
+              output:
+                data: '{{ _s }}'
+          - match: [301, 302, 307, 308]
+            do:
+              set:
+                - _s: redirect
+              output:
+                data: '{{ _s }}'
+          - match: 404
+            do:
+              set:
+                - _s: not found
+              output:
+                data: '{{ _s }}'
+        default:
+          set:
+            - _s: 'error {{ order["status"] }}'
+          output:
+            data: '{{ _s }}'
+      output:
+        as: status_text#
+
+    # --- 4. no default: the result may be null -------------------------------
+    # Only wholesale orders get a pallet note; everything else stores null.
+    - task_name: pallet-note
+      switch:
+        value: '{{ order["kind"] }}'
+        cases:
+          - match: wholesale
+            do:
+              set:
+                - _n: ship on pallet
+              output:
+                data: '{{ _n }}'
+      output:
+        as: pallet_note#
+
+    # --- 5. switch inside a loop: route each item ----------------------------
+    # The loop collects one switch result per item, in input order.
+    - task_name: route-lines
+      loop:
+        in: '{{ ["book", "laptop", "apple", "pen"] }}'
+        foreach: product
+        do:
+          task_name: route-one
+          switch:
+            value: '{{ product }}'
+            cases:
+              - match: [book, pen]
+                do:
+                  set:
+                    - _dept: stationery
+                  output:
+                    data: '{{ _dept }}'
+              - match: laptop
+                do:
+                  set:
+                    - _dept: electronics
+                  output:
+                    data: '{{ _dept }}'
+            default:
+              set:
+                - _dept: general
+              output:
+                data: '{{ _dept }}'
+      output:
+        as: departments#            # [stationery, electronics, general, stationery]
+
+    - task_name: build-summary
+      set:
+        - summary:
+            discount: '{{ discount }}'
+            lane: '{{ lane }}'
+            status_text: '{{ status_text }}'
+            pallet_note: '{{ pallet_note }}'
+            departments: '{{ departments }}'

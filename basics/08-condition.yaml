@@ -5,6 +5,9 @@
 # branches   if / elif / else: the first true condition's task runs.
 # switch     compare one value against cases: the first matching case runs.
 #
+# This file is the overview. 19-branches and 20-switch cover each in depth,
+# including using their result through `output.as`.
+#
 # A condition is an expression that must evaluate to a bool, or a structured
 # tree that nests freely and short-circuits:
 #   {and: [c, ...]}   every sub-condition holds

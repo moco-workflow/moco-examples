@@ -1,0 +1,128 @@
+# What runs, and in what order, when a transition fires.
+#
+#   external transition (to another state, or back to the same one):
+#       on_exit of the old state  ->  trigger.action  ->  on_enter of the new state
+#       timers of the old state are cancelled; the new state's are armed afresh
+#   internal transition (empty to_state):
+#       trigger.action only. No on_exit, no on_enter, timers keep running
+#   automatic transition (no event_type):
+#       checked right after on_enter finishes, then runs like any external one
+#
+# The machine below appends to `trace` from every callback and action, and the
+# workflow returns it:
+#
+#   start --(automatic)--> working
+#   working --sys.timer.tick (ticks < 2)--------------------> (internal)
+#   working --sys.timer.tick (ticks >= 2, no retry yet)-----> working   self-transition
+#   working --sys.timer.tick (ticks >= 2, retried)----------> done
+#
+# Expected trace (about 6 seconds):
+#   enter start, exit start, action start->working (current_state=start),
+#   enter working #1, tick 1 (internal), tick 2 (internal),
+#   exit working #1, action working->working, enter working #2,
+#   tick 1 (internal), tick 2 (internal),
+#   exit working #2, action working->done, enter done
+#
+# Note `current_state` inside an action is still the old state: the machine moves
+# to the new state just before its on_enter. And the self-transition is a real
+# re-entry: `working`'s on_enter runs again (resetting `ticks`) and its timer is
+# re-armed from zero -- a handy way to restart a state, e.g. to retry its work.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sm-callback-order
+  tags: [build-my-workflow, state-machine]
+
+context:
+  trace: []
+  ticks: 0
+  entries: 0
+  retried: false
+
+output:
+  final_state: '{{ final_state }}'
+  trace: '{{ trace }}'
+
+main:
+  task_name: callback-order
+  state_machine:
+    initial_state: start
+    timeout_sec: 60
+
+    states:
+      - name: start
+        on_enter:
+          set:
+            - _t: '{{ trace.append("enter start") }}'
+        on_exit:
+          set:
+            - _t: '{{ trace.append("exit start") }}'
+
+      - name: working
+        timers:
+          - name: tick
+            timeout_sec: 1
+            max_timeout_attempts:     # fire forever; the transitions decide
+        on_enter:
+          set:
+            - entries: '{{ entries + 1 }}'
+            - ticks: 0
+            - _t#: '{{ trace.append("enter working #" + str(entries)) }}'
+        on_exit:
+          set:
+            - _t#: '{{ trace.append("exit working #" + str(entries)) }}'
+
+      - name: done
+        is_terminal: true
+        on_enter:
+          set:
+            - _t: '{{ trace.append("enter done") }}'
+
+    transitions:
+      # Automatic: no event_type. Runs once start's on_enter has finished.
+      - from_state: start
+        to_state: working
+        trigger:
+          action:
+            set:
+              - _now: '{{ __sys_info__.get("state_machine", {}).get("current_state") }}'
+              - _t: '{{ trace.append("action start->working (current_state=" + _now + ")") }}'
+
+      # Internal: the action runs, the state and its timer are left alone.
+      - from_state: working
+        to_state:
+        trigger:
+          event_type: sys.timer.tick
+          condition: '{{ ticks < 2 }}'
+          action:
+            set:
+              - ticks: '{{ ticks + 1 }}'
+              - _t#: '{{ trace.append("tick " + str(ticks) + " (internal)") }}'
+
+      # Self-transition: same state, but a full exit and re-entry.
+      - from_state: working
+        to_state: working
+        trigger:
+          event_type: sys.timer.tick
+          condition:
+            and:
+              - '{{ ticks >= 2 }}'
+              - not: '{{ retried }}'
+          action:
+            set:
+              - retried: true
+              - _t#: '{{ trace.append("action working->working") }}'
+
+      - from_state: working
+        to_state: done
+        trigger:
+          event_type: sys.timer.tick
+          condition:
+            and:
+              - '{{ ticks >= 2 }}'
+              - '{{ retried }}'
+          action:
+            set:
+              - _t#: '{{ trace.append("action working->done") }}'
+  output:
+    as: final_state

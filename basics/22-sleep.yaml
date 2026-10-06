@@ -1,0 +1,70 @@
+# Durable sleep: `wait_for` with no `event`.
+#
+#   wait_for:
+#     timeout_sec: 30      required when there is no event
+#
+# The task waits `timeout_sec` and completes with `_` = null. On Temporal this
+# is a durable timer: no worker is held while it waits, and it survives worker
+# restarts, so sleeping for hours or days is fine.
+#
+# Compare `builtin.delay`: an activity that sleeps inside a worker. It runs as
+# a Temporal local activity, which holds the workflow task open for the whole
+# delay (nothing else in the workflow progresses meanwhile, see 21-race) and is
+# bounded by the activity timeout. Keep it for short pauses and simulations.
+#
+# The common shape is a poll loop: check, sleep, check again, `raise: break`
+# when done. Here the "check" is simulated -- the job is ready on attempt
+# `ready_after` -- so the example runs without an external system.
+#
+# Try:  -i '{"ready_after": 9}'   never ready within max_attempts
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-sleep
+  tags: [build-my-workflow, basics, level-5-events]
+
+context:
+  status: pending
+  attempts: 0
+
+input:
+  ready_after: 3
+  max_attempts: 5
+  poll_interval_sec: 2
+
+output:
+  status: '{{ status }}'
+  attempts: '{{ attempts }}'
+
+main:
+  tasks:
+    # --- 1. a plain sleep ----------------------------------------------------
+    - task_name: settle
+      wait_for:
+        timeout_sec: 1
+
+    # --- 2. a poll loop ------------------------------------------------------
+    - task_name: poll-job
+      loop:
+        in: '{{ range(max_attempts) }}'
+        foreach: attempt
+        do:
+          tasks:
+            - task_name: check-job
+              set:
+                - attempts: '{{ attempt + 1 }}'
+                - status#: '{{ "done" if attempts >= ready_after else "pending" }}'
+            - task_name: stop-when-done
+              raise:
+                if: '{{ status == "done" }}'
+                type: break
+            # Not reached on the attempt that finds the job done.
+            - task_name: wait-before-next-check
+              wait_for:
+                timeout_sec: '{{ poll_interval_sec }}'
+
+    # --- 3. give up cleanly --------------------------------------------------
+    - task_name: report-timeout
+      skip_if: '{{ status == "done" }}'
+      set:
+        - status#: 'gave up after {{ attempts }} attempts'

@@ -1,0 +1,168 @@
+# `branches` in depth: if / elif / else.
+#
+#   branches:
+#     - if: <cond>       required, first
+#       do: <task>
+#     - elif: <cond>     any number
+#       do: <task>
+#     - else:            optional, last; written with no value
+#       do: <task>
+#
+# Conditions are checked in order. Only the FIRST true one runs its `do`; the
+# rest are not even evaluated. The result of a branches task (`_`) is the result
+# of the `do` that ran, or null when nothing matched and there is no `else`.
+#
+# A condition must evaluate to a bool. A non-empty list is NOT "true": a
+# condition of '{{ items }}' fails with ConditionTypeError. Write
+# '{{ len(items) > 0 }}'.
+#
+# Use branches for ranges and unrelated tests. To compare ONE value against a
+# fixed set of cases, `switch` (20-switch) reads better. 08-condition shows both
+# side by side.
+#
+# Try:  -i '{"score": 95, "items": [], "express": true}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-branches
+  tags: [build-my-workflow, basics, level-3-control-flow]
+
+input:
+  score: 72
+  items: [pen, ink]
+  express: false
+  country: US
+
+output: '{{ summary }}'
+
+main:
+  tasks:
+    # --- 1. order matters: the first true condition wins ---------------------
+    # 72 passes both `>= 60` and `>= 70`, so the narrower test must come first.
+    # Each `do` decides the result through `output.data`, and the branches task
+    # stores it with `output.as`: no variable is written inside the branches.
+    - task_name: grade
+      branches:
+        - if: '{{ score >= 90 }}'
+          do:
+            set:
+              - _g: A
+            output:
+              data: '{{ _g }}'
+        - elif: '{{ score >= 70 }}'
+          do:
+            set:
+              - _g: B
+            output:
+              data: '{{ _g }}'
+        - elif: '{{ score >= 60 }}'
+          do:
+            set:
+              - _g: C
+            output:
+              data: '{{ _g }}'
+        - else:
+          do:
+            set:
+              - _g: F
+            output:
+              data: '{{ _g }}'
+      output:
+        as: grade#
+
+    # --- 2. no else: nothing may run -----------------------------------------
+    # With no matching item the result is null, so `output.as` stores null.
+    # That is the clean way to get an "optional" value without __context__
+    # checks later.
+    - task_name: honours
+      branches:
+        - if: '{{ score >= 90 }}'
+          do:
+            set:
+              - _h: with distinction
+            output:
+              data: '{{ _h }}'
+      output:
+        as: honours#                # null for score 72
+
+    # --- 3. a `do` can be any task, including a tasks container --------------
+    # Here each branch is several steps. A sequential container's result is the
+    # list of its children's results, so pick the one you want with `output`.
+    - task_name: shipping
+      branches:
+        - if: '{{ len(items) == 0 }}'
+          do:
+            set:
+              - _plan: {method: none, cost: 0}
+            output:
+              data: '{{ _plan }}'
+        - elif: '{{ express }}'
+          do:
+            tasks:
+              - task_name: express-base
+                set:
+                  - base@: 25
+              - task_name: express-per-item
+                set:
+                  - _plan:
+                      method: express
+                      cost: '{{ base + 5 * len(items) }}'
+                output:
+                  data: '{{ _plan }}'
+            output:
+              data: '{{ _[-1] }}'
+        - else:
+          do:
+            set:
+              - _plan: {method: standard, cost: '{{ 2 * len(items) }}'}
+            output:
+              data: '{{ _plan }}'
+      output:
+        as: shipping#
+
+    # --- 4. nesting, and and/or/not trees in elif ----------------------------
+    # A `do` may itself be a branches task. Structured conditions work in `if`
+    # and `elif` exactly as in skip_if.
+    - task_name: customs
+      branches:
+        - if: '{{ country == "US" }}'
+          do:
+            set:
+              - _c: none
+            output:
+              data: '{{ _c }}'
+        - elif:
+            and:
+              - '{{ country in ["CA", "MX"] }}'
+              - not: '{{ express }}'
+          do:
+            set:
+              - _c: usmca-ground
+            output:
+              data: '{{ _c }}'
+        - else:
+          do:
+            task_name: customs-international
+            branches:
+              - if: '{{ len(items) > 3 }}'
+                do:
+                  set:
+                    - _c: full-declaration
+                  output:
+                    data: '{{ _c }}'
+              - else:
+                do:
+                  set:
+                    - _c: simple-declaration
+                  output:
+                    data: '{{ _c }}'
+      output:
+        as: customs#
+
+    - task_name: build-summary
+      set:
+        - summary:
+            grade: '{{ grade }}'
+            honours: '{{ honours }}'
+            shipping: '{{ shipping }}'
+            customs: '{{ customs }}'
