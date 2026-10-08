@@ -24,11 +24,22 @@
 # web honour MOCO_HTTP_PROXY; site, github and gdrive connect directly.
 #
 # NEEDS: a pgvector database behind a secret (default MOCO_PGVECTOR_CONN), an
-# embeddings endpoint (default: local Ollama with nomic-embed-text, 768 dims),
-# and for synthesize an LLM (default: the MY_LLM_TOKEN gateway). The worker must
-# be able to write rag_file_dir. See ../../../moco-examples/rag-demo for more.
+# embeddings endpoint, and for synthesize an LLM (key default: MY_LLM_TOKEN).
+# base_url / model_name left empty fall back to the worker's env, and the
+# activity fails if that is unset too:
+#   embed  MOCO_LLM_DEFAULT_EMBED_MODEL_BASE_URL (then MOCO_LLM_DEFAULT_BASE_URL)
+#          / MOCO_LLM_DEFAULT_EMBED_MODEL_NAME
+#   llm    MOCO_LLM_DEFAULT_BASE_URL / MOCO_LLM_DEFAULT_MODEL_NAME
+# embed_dim defaults to 768 (nomic-embed-text); set it to match your embedding
+# model. The worker must be able to write rag_file_dir. See
+# ../../../moco-examples/rag-demo for more.
 #
 #   moco run llama-index.yaml
+#   moco run llama-index.yaml -i '{
+#     "embed": {"apikey_secret_key": "MY_LLM_TOKEN", "base_url": "http://localhost:11434/v1",
+#               "model_name": "nomic-embed-text", "embed_dim": 768},
+#     "llm": {"apikey_secret_key": "MY_LLM_TOKEN", "base_url": "https://<gateway>/v1",
+#             "model_name": "<model>"}}'
 #   moco run llama-index.yaml -i '{"extra_sources": ["docs", "github"]}'
 
 header:
@@ -61,13 +72,13 @@ input:
   pgvector_secret_key: MOCO_PGVECTOR_CONN
   embed:
     apikey_secret_key: MY_LLM_TOKEN  # ignored by Ollama, but required
-    base_url: http://localhost:11434/v1
-    model_name: nomic-embed-text
+    base_url:    # default: worker env, see the header
+    model_name:  # default: worker env, see the header
     embed_dim: 768
   llm:
     apikey_secret_key: MY_LLM_TOKEN
-    base_url: https://llm.dev.bloomberg.com/v1
-    model_name: dsp.gemma-4-26b
+    base_url:    # default: worker env, see the header
+    model_name:  # default: worker env, see the header
   # used only by the opt-in sources
   doc_urls: [https://raw.githubusercontent.com/temporalio/documentation/main/README.md]
   web_urls: [https://example.com]

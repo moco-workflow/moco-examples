@@ -7,8 +7,8 @@
 #     choice    pick one label from criteria {label: description-or-null}
 #     score     expected score on an ordered rubric (criteria is a list, 0..n-1)
 #   model / base_url / apikey_secret_key / extra_body
-#               default to TYPESAFE_DEFAULT_MODEL / TYPESAFE_BASE_URL /
-#               TYPESAFE_API_KEY on the worker (a local Laya server needs no key)
+#               default to TYPESAFE_DEFAULT_MODEL / TYPESAFE_DEFAULT_BASE_URL /
+#               TYPESAFE_DEFAULT_API_KEY on the worker (a local Laya server needs no key)
 #
 # The answer comes back grouped by question type -- nouls / choices / scores,
 # each keyed by question name -- plus per-question detail and token usage.

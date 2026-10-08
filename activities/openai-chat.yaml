@@ -1,8 +1,9 @@
 # `openai.chat.completions` against any OpenAI-compatible endpoint.
 #
 #   apikey_secret_key  name of the secret holding the API key (never inline)
-#   base_url / model_name   default to MOCO_LLM_DEFAULT_BASE_URL / _MODEL_NAME
-#                      on the worker; base_url is used as-is, so include /v1
+#   base_url / model_name   when not given, the activity falls back to the worker's
+#                      MOCO_LLM_DEFAULT_BASE_URL / _MODEL_NAME, and fails if
+#                      those are unset too; base_url is used as-is, so include /v1
 #   messages           standard chat messages (system / user / assistant / tool)
 #   response_format    {type: json_object} for JSON mode
 #   tools / tool_choice    function calling
@@ -18,14 +19,12 @@
 #      "tool" (a transform here; any activity in practice) and sends the result
 #      back for the final answer -- the basic agent loop, one turn deep
 #
-# NEEDS: an LLM endpoint and its key in a secret. Defaults target the internal
-# gateway with MY_LLM_TOKEN. The error "token authentication failure for
-# principal ..." means that token has expired -- re-upload it; it is not a
-# problem with this spec. Any OpenAI-compatible endpoint works, e.g.
+# NEEDS: an LLM endpoint and model (input or worker env), and its key in a
+# secret (default MY_LLM_TOKEN). The error "token authentication failure for principal ..."
+# means that token has expired -- re-upload it; it is not a problem with this
+# spec. Any OpenAI-compatible endpoint works, e.g.
 #   moco run openai-chat.yaml -i '{"base_url": "https://api.openai.com/v1",
 #     "model_name": "gpt-4o-mini", "apikey_secret_key": "MY_OPENAI_APIKEY"}'
-#
-#   moco run openai-chat.yaml
 
 header:
   schema_version: 2.0.0
@@ -34,8 +33,8 @@ header:
 
 input:
   apikey_secret_key: MY_LLM_TOKEN
-  base_url: https://llm.dev.bloomberg.com/v1
-  model_name: dsp.gemma-4-26b
+  base_url:    # default: MOCO_LLM_DEFAULT_BASE_URL on the worker
+  model_name:  # default: MOCO_LLM_DEFAULT_MODEL_NAME on the worker
   proxy:
   city: Paris
 
