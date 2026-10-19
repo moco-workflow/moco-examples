@@ -1,0 +1,104 @@
+# `mcp.list_tools`: list the tools an MCP server exposes (streamable-http).
+#
+#   endpoint, headers, encrypted_auth_token   same as mcp.call_tool
+#   include         optional list of tool names to keep
+#
+# Output: {server: {name, version, protocol_version},
+#          tools: [{name, title, description, input_schema, output_schema,
+#                   annotations, hash}],   -- sorted by name
+#          hash}
+#
+# Each tool's `hash` covers its name, description and input/output schema; the
+# top-level `hash` covers the whole listing, so it also changes when a tool is
+# added or removed. Store the hash you reviewed and compare on the next run:
+# this spec does that with `expected_hash` (pass the `hash` from a previous run
+# to see a match, anything else to see a mismatch).
+#
+# Unlike mcp.call_tool, a connection or protocol error FAILS the activity, so
+# an empty `tools` list always means the server has no (matching) tools.
+#
+# THE SERVER IS MOCO ITSELF: moco-server serves MCP at /mcp/ (execute_workflow,
+# list_schedules, ...), so by default the spec lists the local moco's own tools.
+# Keep the trailing slash: /mcp answers with a redirect.
+#
+# NEEDS: a moco API key stored as a secret, because moco's MCP endpoint
+# requires a bearer token. Once:
+#
+#   moco secret upload MOCO_MCP_APIKEY \
+#     "$(moco apikey create mcp-list-tools-demo --expires-in 7d)"
+#
+# (piped, `apikey create` prints only the key, so it never hits your terminal
+# or shell history). builtin.secret.get returns the key still encrypted and
+# mcp.list_tools decrypts it internally, so the plaintext never enters workflow
+# context. The stored key acts as you on every moco tool, not just listing,
+# hence the short expiry; `moco secret delete MOCO_MCP_APIKEY` when done. To list another
+# server, override endpoint / secret_name (or set secret_name to null and pass
+# headers for a server without bearer auth).
+#
+#   moco run mcp-list-tools.yaml
+#   moco run mcp-list-tools.yaml -i '{"expected_hash": "<hash from a previous run>"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-mcp-list-tools
+  tags: [act-demo, mcp]
+
+context:
+  mcp_token:
+
+input:
+  endpoint: http://localhost:8080/mcp/
+  secret_name: MOCO_MCP_APIKEY
+  headers:
+  include: [execute_workflow, get_workflow_status]
+  expected_hash:  # the reviewed `hash` of the included tools
+output: '{{ report }}'
+
+main:
+  tasks:
+    # Fetched right before use: the encrypted copy expires (60 s by default).
+    - task_name: get-token
+      skip_if: '{{ not secret_name }}'
+      activity:
+        type: builtin.secret.get
+        input:
+          secret_name: '{{ secret_name }}'
+      output:
+        as: mcp_token
+
+    # --- 1. discover: every tool the server offers ------------------------------
+    - task_name: list-all
+      activity:
+        type: mcp.list_tools
+        input:
+          endpoint: '{{ endpoint }}'
+          headers: '{{ headers }}'
+          encrypted_auth_token: '{{ mcp_token }}'
+      output:
+        set:
+          - server#: '{{ _["server"] }}'
+          - all_tools#: '{{ [t["name"] for t in _["tools"]] }}'
+
+    # --- 2. drift check: only the reviewed tools, compared by hash --------------
+    - task_name: list-included
+      activity:
+        type: mcp.list_tools
+        input:
+          endpoint: '{{ endpoint }}'
+          headers: '{{ headers }}'
+          encrypted_auth_token: '{{ mcp_token }}'
+          include: '{{ include }}'
+      output:
+        as: listing
+
+    - task_name: build-report
+      set:
+        - report:
+            endpoint: '{{ endpoint }}'
+            server: '{{ server }}'
+            all_tools: '{{ all_tools }}'
+            included:
+              '{{ {t["name"]: {"hash": t["hash"], "params": list(t["input_schema"].get("properties", {}))}
+                   for t in listing["tools"]} }}'
+            hash: '{{ listing["hash"] }}'
+            drift: '{{ "not checked" if not expected_hash else ("none" if listing["hash"] == expected_hash else "CHANGED") }}'

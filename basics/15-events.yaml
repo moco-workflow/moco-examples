@@ -40,8 +40,8 @@ main:
 
     # --- 1. async child workflow emits back to the parent ------------------
     # mode: async means the parent does not wait here; it waits below, on the
-    # event. Starting the producer BEFORE the wait_for is important --
-    # see the note about ordering at the bottom of this file.
+    # event. An early event is kept for the wait_for -- see the note about
+    # ordering at the bottom of this file.
     - task_name: start-fulfilment
       workflow:
         contents:
@@ -132,6 +132,8 @@ main:
             cancelled: '{{ cancel_event is not None }}'
             timed_out_as_expected: '{{ cancel_event is None }}'
 
-# Ordering note: a wait_for only sees events published after it starts waiting,
-# and an async producer that finishes first will have its event dropped. Keep
-# the gap small, or give the producer a delay, as the child above does.
+# Ordering note: a wait_for whose topic is written literally is subscribed when
+# the workflow starts, so an event that arrives before the wait_for is reached
+# is kept and handed to it. A topic computed by an expression ('{{ ... }}') is
+# only subscribed at its first wait_for, so start the producer after that, or
+# give it a delay, as the child above does.

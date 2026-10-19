@@ -1,0 +1,115 @@
+# Retry policies whose values are computed: `{{ }}` expressions in retry_policy.
+#
+# Every retry_policy field except non_retryable_error_types takes either a number
+# or an expression, in all three places a policy can be written:
+#
+#   header.metadata.default_activity_retry_policy   the default every activity starts from
+#   activity.options.retry_policy                   one activity, laid over the default
+#   workflow.options.retry_policy                   a sync child workflow
+#
+# WHEN THEY ARE EVALUATED: each time the task runs, in that task's scope, so they
+# see input, context, task-locals and loop variables. The header default is
+# evaluated in the scope of each activity that uses it -- keep it to names that
+# exist everywhere (input, context). An expression must evaluate to a number;
+# non_retryable_error_types is always a literal list.
+#
+# Policies are applied by the Temporal runtime; the in-memory runtime ignores them.
+# The output reports the values the policies were computed from.
+#
+# Try:  -i '{"environment": "dev"}'     one attempt everywhere, short timeouts
+#       -i '{"max_retries": 8}'         more attempts for the upload
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-retry-policy
+  tags: [build-my-workflow, basics, level-5-errors]
+  metadata:
+    default_activity_retry_policy:
+      # Fail fast outside prod, retry in prod.
+      max_attempts: '{{ 3 if environment == "prod" else 1 }}'
+      timeout_sec: '{{ 60 if environment == "prod" else 10 }}'
+      initial_interval_sec: 1
+
+input:
+  environment: prod
+  max_retries: 4
+  files:
+    - {name: small.csv, size_mb: 1}
+    - {name: large.csv, size_mb: 40}
+
+context:
+  timeouts: []
+
+output:
+  environment: '{{ environment }}'
+  upload_attempts: '{{ max_retries + 1 }}'
+  per_file_timeout_sec: '{{ timeouts }}'
+
+main:
+  tasks:
+    # --- 1. the header default alone ------------------------------------------
+    # No options.retry_policy: max_attempts and timeout_sec come from the header
+    # expressions, evaluated for this activity.
+    - task_name: warm-up
+      activity:
+        type: builtin.delay
+        input:
+          duration: 1s
+
+    # --- 2. a per-activity policy from input ----------------------------------
+    # Expressions and literals mix freely. timeout_sec and initial_interval_sec
+    # are still inherited from the header default.
+    - task_name: upload
+      activity:
+        type: builtin.delay
+        input:
+          duration: 1s
+        options:
+          retry_policy:
+            max_attempts: '{{ max_retries + 1 }}'     # retries + the first attempt
+            backoff_coefficient: 2.0
+            maximum_interval_sec: '{{ 5 * max_retries }}'
+            non_retryable_error_types: [ValueError]   # literal only
+
+    # --- 3. a per-item policy inside a loop -----------------------------------
+    # The loop variable is in scope: each file gets a timeout sized to it,
+    # computed into a container-scoped variable (timeout@) the activity reads.
+    - task_name: process-files
+      loop:
+        in: '{{ files }}'
+        foreach: file
+        do:
+          tasks:
+            - set:
+                - timeout@: '{{ 10 + file["size_mb"] * 3 }}'
+                - _t: '{{ timeouts.append(timeout) }}'
+            - task_name: process-file
+              activity:
+                type: builtin.delay
+                input:
+                  duration: 1s
+                options:
+                  retry_policy:
+                    timeout_sec: '{{ timeout }}'
+
+    # --- 4. a sync child workflow ---------------------------------------------
+    # A sync child is a separate workflow, so it has its own policy. Here the
+    # whole child run gets one attempt and a timeout scaled to the file count.
+    - task_name: summarize
+      workflow:
+        contents:
+          - header:
+              schema_version: 2.0.0
+              workflow_name: basics-retry-policy-summary
+            input:
+              count:
+            output: '{{ count }}'
+            main:
+              set: []
+        mode: sync
+        input:
+          count: '{{ len(files) }}'
+        options:
+          retry_policy:
+            max_attempts: 1
+            timeout_sec: '{{ 60 * len(files) }}'

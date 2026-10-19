@@ -49,6 +49,8 @@ debugging tool, used throughout.
 | [22-sleep](22-sleep.yaml) | `wait_for` with no event as a durable timer; a poll loop with `raise: break` |
 | [23-checkpoint](23-checkpoint.yaml) | `checkpoint` (continue-as-new): writing `main` so it resumes from the context |
 | [24-task-fields](24-task-fields.yaml) | the fields every task shares: `task_name`, `skip_if`, `output`, `on_error`, and the order they run in |
+| [25-request-reply](25-request-reply.yaml) | `request` and `emit_event.reply_to`: several requests in flight, each matched to its reply; a missing reply as `RequestTimeoutError` |
+| [26-retry-policy](26-retry-policy.yaml) | `retry_policy` values as expressions: a header default that depends on the input, a per-activity policy, a per-item timeout in a loop, a `sync` child's policy |
 
 ## Lowering to v1
 
@@ -71,3 +73,9 @@ describe. These do not:
 - **21-race:** the all-fail race loses its `on_error` (W210) and fails the workflow.
 - **24-task-fields:** the `on_error` handlers are dropped (W210), so the default inputs fail
   at the 503; `-i '{"status_code": 200}'` gets further, to the failing `output` of `read-title`.
+- **25-request-reply:** `request` lowers to `emit_event` + `wait_for` + a raise (W280) and
+  `reply_to` to explicit routing (W281); the `on_error` around the unanswered request is dropped
+  (W210), so on v1 `ask-nobody` fails the workflow.
+- **26-retry-policy:** v1 takes only numbers in an activity's `retry_policy`, so the expression
+  fields are dropped (W203) and those activities fall back to the remaining fields and the
+  activity's own defaults. The `sync` child's policy is kept: v1 evaluates child workflow options.

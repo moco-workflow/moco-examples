@@ -27,6 +27,7 @@ evaluated, and the specs use this throughout.
 | Spec | Activities covered | Needs |
 |---|---|---|
 | [`builtin-basics`](builtin-basics.yaml) | `builtin.now`, `builtin.delay` | — |
+| [`builtin-activity-list-manifests`](builtin-activity-list-manifests.yaml) | `builtin.activity.list_manifests`: activities with descriptions and flattened input schemas, as tool definitions | — |
 | [`builtin-state`](builtin-state.yaml) | all 9 `builtin.state.*` (set/get/get_with_ts/list/list_namespaces/update_topic/del/delete_by_topic/delete_namespace) | state store |
 | [`builtin-secret`](builtin-secret.yaml) | `builtin.secret.list`, `get`; `upload` → `delete` only if you pass a pre-encrypted blob | an existing secret (default `MY_LLM_TOKEN`) |
 | [`builtin-execute-workflow`](builtin-execute-workflow.yaml) | `builtin.execute_workflow` (inline content, chosen at runtime, `catch_exception`) | — |
@@ -45,7 +46,8 @@ evaluated, and the specs use this throughout.
 | [`rabbit`](rabbit.yaml) | `rabbit.publish`, `rabbit.receive` | RabbitMQ (`MOCO_RMQ_CONNECTION_URL`) |
 | [`websocket-subscribe`](websocket-subscribe.yaml) | `websocket.subscribe` (+ a local server started via `shell.run`) | — (or network to your own feed) |
 | [`graphql-subscribe`](graphql-subscribe.yaml) | `graphql.subscribe` (+ a local graphql-transport-ws server) | — (or network to your own server) |
-| [`mcp-call-tool`](mcp-call-tool.yaml) | `mcp.call_tool`, both blocking and streaming (+ a local FastMCP server) | — (or network to your own server) |
+| [`mcp-call-tool`](mcp-call-tool.yaml) | `mcp.call_tool` against the local moco's own MCP endpoint (`execute_workflow`), both blocking and streaming its debug events as progress | moco API key secret (`MOCO_MCP_APIKEY`); RabbitMQ on moco-server for progress |
+| [`mcp-list-tools`](mcp-list-tools.yaml) | `mcp.list_tools` against the local moco's own MCP endpoint: discovery, `include` filter and a hash-based drift check | moco API key secret (`MOCO_MCP_APIKEY`) |
 | [`openai-chat`](openai-chat.yaml) | `openai.chat.completions` (plain, JSON mode, tool calling) | LLM token (`MY_LLM_TOKEN`) |
 | [`typesafe-system-one`](typesafe-system-one.yaml) | `typesafe.system_one` (noul / choice / score) | TypeSafe or local Laya endpoint |
 | [`typesafe-alert-triage`](typesafe-alert-triage.yaml) | `typesafe.system_one` on JSON state: questions built from data, described labels, probability-margin guard → page / ticket / human review | TypeSafe or local Laya endpoint |
@@ -65,9 +67,10 @@ evaluated, and the specs use this throughout.
   lost, so the kafka and rabbit specs publish from an async child workflow.
 - **`builtin.delay` is a local activity.** Right after an `async_mode` activity it does *not*
   give that activity a head start on Temporal. Use `execute_locally: false`, or poll for
-  readiness, which is what the websocket, graphql and mcp specs do.
+  readiness, which is what the websocket and graphql specs do.
 - **`shell.run`'s `env` replaces the whole environment**, including `PATH`. To add one variable,
   prefix the command instead: `FOO=bar cmd`.
 - **Some failures come back as data.** `kafka.publish` returns `result: fail`,
-  `mcp.call_tool` returns `result: null`, and `claude_agent.query` returns `is_error: true`.
+  `mcp.call_tool` returns `result: null` (and moco's `execute_workflow` tool answers
+  `success: false`), and `claude_agent.query` returns `is_error: true`.
   The specs check for these explicitly.

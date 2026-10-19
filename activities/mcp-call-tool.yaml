@@ -1,6 +1,7 @@
 # `mcp.call_tool`: invoke a tool on an MCP server (streamable-http transport).
 #
-#   endpoint, tool_name, arguments, headers (e.g. Authorization)
+#   endpoint, tool_name, arguments, headers, encrypted_auth_token (the output of
+#                   builtin.secret.get; sent as Authorization: Bearer, never plaintext)
 #   relay_topic / relay_event_type   where the tool's PROGRESS notifications go:
 #                   each one becomes an event with
 #                   event["data"] = {progress, total, message}
@@ -16,17 +17,28 @@
 #                    the activity returned (the transition trigger below uses
 #                    '{{ call_token }}' for exactly that)
 #
-# SELF-CONTAINED BY DEFAULT: with use_local_server: true the spec starts a tiny
-# FastMCP server (the `mcp` package moco-core already depends on) via shell.run,
-# with two tools: add(a, b) and count_to(n), which reports progress once per
-# step. The server exits shortly after count_to finishes. To call a real server
-# instead, override endpoint / tool names / arguments / headers, e.g.
+# THE SERVER IS MOCO ITSELF: moco-server serves MCP at /mcp/, and its
+# execute_workflow tool runs a wfspec and returns its output as JSON text,
+# {"success": ..., "result": ...}. Run with debug_mode, it also reports every
+# debug event of that run (workflow_start, a data_log per `#`-suffixed
+# variable, workflow_end) as an MCP progress notification whose `message` is
+# the event as JSON -- which is what the streaming half listens to. The child
+# specs below are passed inline as wfspec_info.content. Keep the trailing slash
+# on the endpoint: /mcp answers with a redirect.
 #
-#   moco run mcp-call-tool.yaml -i '{"use_local_server": false,
-#     "endpoint": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer ..."}}'
+# NEEDS: a moco API key stored as a secret, because moco's MCP endpoint
+# requires a bearer token. Once:
 #
-# NEEDS: python on the worker PATH with `mcp` (default mode), or network access
-# to `endpoint`. The MCP client does not use MOCO_HTTP_PROXY.
+#   moco secret upload MOCO_MCP_APIKEY \
+#     "$(moco apikey create mcp-call-tool-demo --expires-in 7d)"
+#
+# (piped, `apikey create` prints only the key, so it never hits your terminal
+# or shell history). builtin.secret.get returns the key still encrypted and
+# mcp.call_tool decrypts it internally, so the plaintext never enters workflow
+# context. The stored key acts as you on every moco tool, hence the short
+# expiry; `moco secret delete MOCO_MCP_APIKEY` when done. Progress also needs
+# moco-server to have its debug event bus (MOCO_RMQ_CONNECTION_URL); without it
+# the call still returns, with no progress events.
 #
 #   moco run mcp-call-tool.yaml
 #   moco run mcp-call-tool.yaml -i '{"steps": 5}'
@@ -37,50 +49,47 @@ header:
   tags: [act-demo, mcp]
 
 context:
+  mcp_token:
   progress_events: []
   final_result:
   timed_out: false
-  server_script#literal: |
-    python - <<'PY'
-    import asyncio, os, threading
-    from mcp.server.fastmcp import Context, FastMCP
-    server = FastMCP("act-demo", host="127.0.0.1", port=int(os.environ["MCP_PORT"]))
-    @server.tool()
-    def add(a: int, b: int) -> int:
-        """Add two integers."""
-        return a + b
-    @server.tool()
-    async def count_to(n: int, ctx: Context) -> str:
-        """Count to n, reporting progress at every step."""
-        for i in range(1, n + 1):
-            await asyncio.sleep(0.5)
-            await ctx.report_progress(i, n, f"step {i} of {n}")
-        threading.Timer(3, os._exit, [0]).start()    # stop the demo server soon after
-        return f"counted to {n}"
-    threading.Timer(90, os._exit, [0]).start()        # hard stop if never called
-    server.run(transport="streamable-http")
-    PY
-  # Polls until the server's port accepts connections (fails after ~30s).
-  wait_script#literal: |
-    python - <<'PY'
-    import os, socket, sys, time
-    port = int(os.environ["PORT"])
-    for _ in range(60):
-        try:
-            socket.create_connection(("127.0.0.1", port), 1).close()
-            sys.exit(0)
-        except OSError:
-            time.sleep(0.5)
-    sys.exit(f"port {port} never opened")
-    PY
+  # Child spec for the plain call: adds two numbers.
+  add_spec#literal: |
+    header: {schema_version: 2.0.0, workflow_name: act-mcp-call-tool-add}
+    input: {a: 0, b: 0}
+    output: '{{ a + b }}'
+    main:
+      tasks:
+        - task_name: noop
+          set:
+            - done: true
+  # Child spec for the streaming call: counts to n, one data_log per step.
+  count_spec#literal: |
+    header: {schema_version: 2.0.0, workflow_name: act-mcp-call-tool-count}
+    input: {n: 3}
+    output: '{{ "counted to " + str(n) }}'
+    main:
+      tasks:
+        - task_name: count
+          loop:
+            in: '{{ list(range(1, n + 1)) }}'
+            foreach: i
+            do:
+              task_name: tick
+              tasks:
+                - task_name: pause
+                  wait_for:
+                    timeout_sec: 0.5
+                - task_name: report
+                  set:
+                    - step#: '{{ i }}'
 
 input:
-  use_local_server: true
-  port: 18767
-  endpoint:  # default: http://127.0.0.1:<port>/mcp
+  endpoint: http://localhost:8080/mcp/
+  secret_name: MOCO_MCP_APIKEY
   headers:
   steps: 3
-  listen_timeout_sec: 30
+  listen_timeout_sec: 60
 output: '{{ report }}'
 
 main:
@@ -88,39 +97,30 @@ main:
     - task_name: ids
       set:
         - self_id: '{{ __sys_info__.get("workflow_id") or __sys_info__.get("trace_id") }}'
-        - mcp_endpoint#: '{{ endpoint or "http://127.0.0.1:" + str(port) + "/mcp" }}'
 
-    - task_name: start-local-server
-      skip_if: '{{ not use_local_server }}'
-      tasks:
-        - task_name: run-server
-          activity:
-            type: shell.run
-            input:
-              # prefixed, not `env`: env would replace PATH too
-              command: '{{ "MCP_PORT=" + str(int(port)) + " " + server_script }}'
-              timeout: 100
-            options:
-              async_mode: true
-        # A regular activity (not local like builtin.delay), so the async
-        # server activity above is scheduled before this runs.
-        - task_name: wait-for-server
-          activity:
-            type: shell.run
-            input:
-              command: '{{ "PORT=" + str(int(port)) + " " + wait_script }}'
-              check: true
-              timeout: 40
+    # Fetched right before use: the encrypted copy expires (60 s by default).
+    - task_name: get-token
+      skip_if: '{{ not secret_name }}'
+      activity:
+        type: builtin.secret.get
+        input:
+          secret_name: '{{ secret_name }}'
+      output:
+        as: mcp_token
 
     # --- 1. plain call: block until the tool returns ---------------------------
     - task_name: call-add
       activity:
         type: mcp.call_tool
         input:
-          endpoint: '{{ mcp_endpoint }}'
+          endpoint: '{{ endpoint }}'
           headers: '{{ headers }}'
-          tool_name: add
-          arguments: {a: 2, b: 40}
+          encrypted_auth_token: '{{ mcp_token }}'
+          tool_name: execute_workflow
+          arguments:
+            wfspec_info:
+              content: '{{ add_spec }}'
+            input_data: {a: 2, b: 40}
         options:
           # The activity notices the tool has returned on its next heartbeat
           # tick (default ~20 s); a short interval makes plain calls snappy.
@@ -133,12 +133,24 @@ main:
           - add_result#: '{{ _["result"] }}'
 
     # A connection or protocol error does NOT fail the activity: the provider
-    # logs it on the worker and returns result: null. Check for it.
+    # logs it on the worker and returns result: null. And execute_workflow
+    # reports a failed child run as success: false, not as an MCP error.
+    # Check for both.
     - task_name: check-add
-      raise:
-        if: '{{ add_result is None }}'
-        type: terminate
-        message: 'mcp.call_tool got no result from {{ mcp_endpoint }} (see worker log)'
+      tasks:
+        - task_name: no-result
+          raise:
+            if: '{{ add_result is None }}'
+            type: terminate
+            message: 'mcp.call_tool got no result from {{ endpoint }} (see worker log)'
+        - task_name: parse
+          set:
+            - add_reply#: '{{ json.loads(add_result["content"][0]["text"]) }}'
+        - task_name: child-failed
+          raise:
+            if: '{{ not add_reply["success"] }}'
+            type: terminate
+            message: 'execute_workflow failed: {{ add_reply.get("error") }}'
 
     # --- 2. streaming call: progress events + async completion ----------------
     - task_name: stream-progress
@@ -149,15 +161,21 @@ main:
           - name: listen
             timeout_sec: '{{ listen_timeout_sec }}'
             on_enter:
-              task_name: call-count-to
+              task_name: call-count
               activity:
                 type: mcp.call_tool
                 input:
-                  endpoint: '{{ mcp_endpoint }}'
+                  endpoint: '{{ endpoint }}'
                   headers: '{{ headers }}'
-                  tool_name: count_to
+                  encrypted_auth_token: '{{ mcp_token }}'
+                  tool_name: execute_workflow
                   arguments:
-                    n: '{{ steps }}'
+                    wfspec_info:
+                      content: '{{ count_spec }}'
+                    input_data:
+                      n: '{{ steps }}'
+                    options:
+                      debug_mode: true
                   relay_topic: act_mcp_relay
                   relay_event_type: mcp_progress
                   target_workflow_id: '{{ self_id }}'
@@ -175,13 +193,15 @@ main:
             is_terminal: true
 
         transitions:
+          # message is the child run's debug event as JSON
           - from_state: listen
             trigger:
               event_type: mcp_progress
               action:
                 set:
-                  - _t: '{{ progress_events.append(event["data"]) }}'
-                  - progress#: '{{ event["data"]["message"] }}'
+                  - _debug: '{{ json.loads(event["data"]["message"]) }}'
+                  - _t: '{{ progress_events.append({"progress": event["data"]["progress"], "event_type": _debug["event_type"], "event_data": _debug.get("event_data")}) }}'
+                  - progress#: '{{ _debug["event_type"] }}'
 
           # the async completion event: event_type is the token itself
           - from_state: listen
@@ -204,8 +224,8 @@ main:
     - task_name: build-report
       set:
         - report:
-            endpoint: '{{ mcp_endpoint }}'
-            add_result: '{{ add_result }}'
+            endpoint: '{{ endpoint }}'
+            add_result: '{{ add_reply["result"] }}'
             progress_events: '{{ progress_events }}'
-            final_result: '{{ final_result }}'
+            final_result: '{{ json.loads(final_result["result"]["content"][0]["text"]) if final_result and final_result.get("result") else final_result }}'
             timed_out: '{{ timed_out }}'

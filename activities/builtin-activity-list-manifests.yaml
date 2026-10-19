@@ -1,0 +1,45 @@
+# `builtin.activity.list_manifests`: what activities exist, as tool definitions.
+#
+#   include           activity types to list; an entry ending in '.' is a prefix
+#                     ('http.' lists every http activity). Omitted: every activity.
+#   max_schema_chars  an activity whose flattened input schema is longer comes back
+#                     with input_schema null and schema_too_large true (default 20000).
+#
+# Each entry has the activity's description and its input schema as ONE JSON-schema
+# object ($defs inlined), the worker type that runs it, and a hash of what a model
+# would see; the listing has a hash too, so a caller can tell when a moco upgrade
+# changed an activity it offers. Read-only: the source is the generated activity
+# catalog. The agent harness's `activity` tool providers are built on it.
+#
+# NEEDS: nothing. Runs on both runtimes.
+#
+#   moco run builtin-activity-list-manifests.yaml
+#   moco run builtin-activity-list-manifests.yaml -i '{"include": ["sql.query", "k8s."]}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: act-builtin-activity-list-manifests
+  tags: [act-demo, builtin]
+
+input:
+  include: ["http.", "sql.query"]
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: list
+      activity:
+        type: builtin.activity.list_manifests
+        input:
+          include: '{{ include }}'
+      output:
+        as: listing
+
+    - task_name: summarise
+      set:
+        - report: >-
+            {{ {'hash': listing['hash'],
+                'tools': [{'type': a['type'], 'parameters': sorted((a['input_schema'] or {}).get('properties', {})),
+                           'required': (a['input_schema'] or {}).get('required', []), 'too_large': a['schema_too_large']}
+                          for a in listing['activities']]} }}

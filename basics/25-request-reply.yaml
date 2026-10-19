@@ -1,0 +1,117 @@
+# Request/reply between workflows: `request` asks, `emit_event.reply_to` answers.
+#
+#   request:
+#     target_workflow_id: ...   who to ask (required)
+#     topic / event_type / data the request event, as in emit_event
+#     timeout_sec: 10           no reply in time raises RequestTimeoutError
+#
+# `_` of a request is the reply event ({data, event_type, metadata, ...}).
+# Unlike wait_for, a missing reply is an ERROR, not null: a request is a call,
+# so handle it with on_error.
+#
+# The engine pairs each reply with its request by a correlation id it puts in
+# the request's metadata, so you never write a match_expression, and several
+# requests can be in flight at once -- each gets its own answer, in any order.
+# The receiver answers with `emit_event: {reply_to: <the request event>}`,
+# which sends the reply back to whoever asked, on the topic they wait on.
+#
+# To stay self-contained, this workflow is both sides: a state machine serves
+# quotes in one parallel branch while the other branch asks. Normally the
+# server is another workflow (an entity workflow, a long-lived service) and
+# target_workflow_id names it.
+#
+# Compare 15-events, where the same exchange is built by hand from emit_event,
+# wait_for and a match_expression on an id you invent.
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-request-reply
+  tags: [build-my-workflow, basics, level-5-events]
+
+context:
+  self_id:
+  quotes: []
+  missing:
+
+input:
+  skus: [A-1, B-2, C-3]
+
+output:
+  quotes: '{{ quotes }}'
+  missing: '{{ missing }}'
+
+main:
+  tasks:
+    - task_name: resolve-self-id
+      set:
+        - self_id: '{{ __sys_info__.get("workflow_id") or __sys_info__.get("trace_id") }}'
+
+    - props: { execute_mode: parallel }
+      tasks:
+        # --- the server -------------------------------------------------------
+        # A transition with no to_state stays in `serving`, so it answers any
+        # number of requests; `stop` ends it. `event` is the request event, and
+        # reply_to takes it as is.
+        - task_name: quote-service
+          state_machine:
+            event_source_topic: quotes
+            initial_state: serving
+            states:
+              - name: serving
+              - name: stopped
+                is_terminal: true
+            transitions:
+              - from_state: serving
+                trigger:
+                  event_type: get_quote
+                  action:
+                    emit_event:
+                      reply_to: '{{ event }}'
+                      event_type: quote
+                      data:
+                        sku: '{{ event["data"]["sku"] }}'
+                        price: '{{ {"A-1": 12, "B-2": 7, "C-3": 30}.get(event["data"]["sku"], 0) }}'
+              - from_state: serving
+                to_state: stopped
+                trigger:
+                  event_type: stop
+
+        # --- the client -------------------------------------------------------
+        - tasks:
+            # Three requests at once. Replies may come back in any order; each
+            # request still receives its own.
+            - task_name: ask-for-quotes
+              loop:
+                in: '{{ skus }}'
+                foreach: sku
+                execute_mode: parallel
+                do:
+                  request:
+                    target_workflow_id: '{{ self_id }}'
+                    topic: quotes
+                    event_type: get_quote
+                    data: { sku: '{{ sku }}' }
+                    timeout_sec: 10
+                  output:
+                    data: '{{ _["data"] }}'
+              output:
+                as: quotes
+
+            # Nobody serves this topic, so the reply never comes.
+            - task_name: ask-nobody
+              request:
+                target_workflow_id: '{{ self_id }}'
+                topic: nobody_listens
+                event_type: get_quote
+                timeout_sec: 2
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - missing: '{{ _["error_type"] }}'
+
+            - task_name: stop-the-server
+              emit_event:
+                target_workflow_id: '{{ self_id }}'
+                topic: quotes
+                event_type: stop

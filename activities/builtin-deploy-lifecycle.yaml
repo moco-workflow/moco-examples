@@ -303,6 +303,7 @@ context:
               wfspec_name: '{{ ids["wfspec"] }}'
               user_id: '{{ ids["user"] }}'
               stage_id: '{{ stage_id }}'
+              exclude_files: true  # only package_id is read
           output:
             set:
               - resolved_while_deployed#: '{{ _["package_id"] if _ else None }}'
@@ -328,6 +329,7 @@ context:
               wfspec_name: '{{ ids["wfspec"] }}'
               user_id: '{{ ids["user"] }}'
               stage_id: '{{ stage_id }}'
+              exclude_files: true  # only package_id is read
           output:
             set:
               - resolved_after_undeploy#: '{{ _["package_id"] if _ else None }}'
