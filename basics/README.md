@@ -2,7 +2,7 @@
 
 The Moco DSL v2 one feature at a time: tasks, control flow, expressions and errors.
 Numbered as a learning path. The DSL itself is specified in
-[`moco-core/docs/dsl-v2`](../../moco-core/docs/dsl-v2/design.md).
+[`moco-core/docs/dsl`](../../moco-core/docs/dsl/design.md).
 
 These files are **written by hand** to teach v2 idioms, and use only v2 names, comments
 included (`scripts/dsl_convert/tests/test_curated_basics.py` checks this).
@@ -17,7 +17,7 @@ moco run moco-examples/basics/08-condition.yaml -i '{"age": 15, "country": "FR"}
 Check the files without running them:
 
 ```bash
-python moco-core/docs/dsl-v2/validate.py moco-examples/basics
+python moco-core/docs/dsl/validate.py moco-examples/basics
 ```
 
 A variable whose name ends in `#` streams its value to the CLI when it is evaluated — the main

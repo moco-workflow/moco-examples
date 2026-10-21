@@ -95,10 +95,11 @@ context:
               file_order: 0
               filename: '{{ ids["wfspec"] }}.yaml'
               content: |
-                wfspec_name: {{ ids["wfspec"] }}
-                wfspec_version: 1.0.0
-                body:
-                  transform: {output_data: [{hello: v1}]}
+                header:
+                  schema_version: 2.0.0
+                  workflow_name: {{ ids["wfspec"] }}
+                main:
+                  set: [{hello: v1}]
         - task_name: package-file-set-extra
           activity:
             type: builtin.deploy.package.file.set
@@ -146,17 +147,19 @@ context:
                 - file_order: 0
                   filename: '{{ ids["wfspec"] }}.yaml'
                   content: |
-                    wfspec_name: {{ ids["wfspec"] }}
-                    wfspec_version: 1.1.0
-                    body:
-                      transform: {output_data: [{hello: v1.1}]}
+                    header:
+                      schema_version: 2.0.0
+                      workflow_name: {{ ids["wfspec"] }}
+                    main:
+                      set: [{hello: v1.1}]
                 - file_order: 1
                   filename: helper.yaml
                   content: |
-                    wfspec_name: {{ ids["wfspec"] }}-helper
-                    wfspec_version: 1.1.0
-                    body:
-                      transform: {}
+                    header:
+                      schema_version: 2.0.0
+                      workflow_name: {{ ids["wfspec"] }}-helper
+                    main:
+                      set: []
           output:
             set:
               - pkg_v11#: '{{ _["id"] }}'

@@ -14,6 +14,7 @@
 #   name#literal      do NOT evaluate; keep the braces as text
 #   name#jinja        render as a Jinja2 template instead of a Python expression
 #   name#python_glom  evaluate as a glom path over __context__
+#                     (needs MOCO_ENABLE_GLOM=true on the worker; off by default)
 #   name#python       force Python evaluation (repeatable: #python#python)
 #
 # Names every expression can read:
