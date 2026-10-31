@@ -1,0 +1,54 @@
+# Declared schedules: the cadences a workflow is meant to run on, written in its header.
+#
+# header.metadata.schedules is a map of named schedule templates. Declaring one
+# creates nothing: `moco publish` copies the declarations into the package manifest,
+# and once the package is deployed a user creates a schedule from one by name:
+#
+#   moco schedule declared basics-declared-schedules            # list them
+#   moco schedule create basics-declared-schedules --declared nightly
+#       -> schedule <namespace>/basics-declared-schedules.nightly, cron and input
+#          taken from the declaration
+#   moco schedule create basics-declared-schedules --declared every-15m --paused
+#       -> any flag overrides that one field of the declaration
+#
+# Each declaration takes the keys of `moco schedule create`: exactly one of cron (a
+# list; fires on the union) or every_sec, plus timezone, overlap, jitter_sec,
+# catchup_window_sec and paused. `input` is the input every fire gets, and
+# `description` is shown when the declarations are listed.
+#
+# The spec is captured when the schedule is created: republishing with a different
+# declaration does not change existing schedules. `moco schedule update ... --declared`
+# picks the new one up.
+#
+# The engine ignores the block, so running the file directly just runs the workflow:
+#
+# Try:  -i '{"region": "eu"}'
+
+header:
+  schema_version: 2.0.0
+  workflow_name: basics-declared-schedules
+  tags: [build-my-workflow, basics, level-5-events, requires-temporal]
+  metadata:
+    schedules:
+      nightly:
+        description: Full report for the US region, every night at 02:00 New York time
+        cron: ['0 2 * * *']
+        timezone: America/New_York
+        overlap: skip
+        input: {region: us, full: true}
+      every-15m:
+        description: Quick refresh; a late run is dropped rather than queued
+        every_sec: 900
+        jitter_sec: 30
+        overlap: skip
+        catchup_window_sec: 60
+
+input:
+  region: us
+  full: false
+
+output: '{{ report }}'
+
+main:
+  set:
+    - report: '{{ {"region": region, "kind": "full" if full else "quick", "at": str(now())} }}'

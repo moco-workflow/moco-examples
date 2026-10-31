@@ -51,6 +51,7 @@ debugging tool, used throughout.
 | [24-task-fields](24-task-fields.yaml) | the fields every task shares: `task_name`, `skip_if`, `output`, `on_error`, and the order they run in |
 | [25-request-reply](25-request-reply.yaml) | `request` and `emit_event.reply_to`: several requests in flight, each matched to its reply; a missing reply as `RequestTimeoutError` |
 | [26-retry-policy](26-retry-policy.yaml) | `retry_policy` values as expressions: a header default that depends on the input, a per-activity policy, a per-item timeout in a loop, a `sync` child's policy |
+| [27-declared-schedules](27-declared-schedules.yaml) | `header.metadata.schedules`: named schedule templates a user creates by name on the deployed workflow (`moco schedule create <wfspec> --declared <key>`) |
 
 ## Lowering to v1
 
@@ -79,3 +80,5 @@ describe. These do not:
 - **26-retry-policy:** v1 takes only numbers in an activity's `retry_policy`, so the expression
   fields are dropped (W203) and those activities fall back to the remaining fields and the
   activity's own defaults. The `sync` child's policy is kept: v1 evaluates child workflow options.
+- **27-declared-schedules:** v1 has no schedule declarations, so `header.metadata.schedules`
+  is dropped (W201). The workflow itself lowers exactly.
